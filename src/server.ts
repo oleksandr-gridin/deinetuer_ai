@@ -24,6 +24,11 @@ app.all('/incoming-call', (req, reply) => {
   reply.type('text/xml').send(twiml);
 });
 
+app.setErrorHandler((err, _req, reply) => {
+  console.error('UNCAUGHT FASTIFY ERROR:', err);
+  reply.code(500).send();
+});
+
 registerWsBridge(app);
 
 app.listen({ port: PORT, host: '0.0.0.0' }, err => {
