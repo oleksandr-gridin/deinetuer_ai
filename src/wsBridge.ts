@@ -11,17 +11,23 @@ import {
 import { processTranscriptAndSend } from './postProcess';
 
 interface Session {
-  streamSid:  string | null;
+  streamSid: string | null;
   transcript: string;
-  openAi:     WebSocket;
-  twilio:     WebSocket;
+  openAi: WebSocket;
+  twilio: WebSocket;
 }
 
 const LOG_EVENTS = new Set([
+  'response.text.done',
+  'response.complete',
+  'input.transcription.done',
   'response.content.done',
   'response.done',
   'conversation.item.input_audio_transcription.completed'
 ]);
+
+const DEBUG_ALL = process.env.DEBUG === 'true';
+
 
 export function registerWsBridge(app: FastifyInstance) {
 
@@ -45,16 +51,16 @@ export function registerWsBridge(app: FastifyInstance) {
         {
           headers: {
             Authorization: `Bearer ${OPENAI_API_KEY}`,
-            'OpenAI-Beta' : 'realtime=v1'
+            'OpenAI-Beta': 'realtime=v1'
           }
         }
       );
 
       sessions.set(sessionId, {
-        streamSid : null,
+        streamSid: null,
         transcript: '',
-        openAi    : openAiWs,
-        twilio    : twilioWs
+        openAi: openAiWs,
+        twilio: twilioWs
       });
 
       /* session.update после открытия соединения */
@@ -65,15 +71,17 @@ export function registerWsBridge(app: FastifyInstance) {
           type: 'session.update',
           session: {
             turn_detection: { type: 'server_vad' },
-            input_audio_format : 'g711_ulaw',
+            input_audio_format: 'g711_ulaw',
             output_audio_format: 'g711_ulaw',
-            voice       : VOICE,
+            voice: VOICE,
             instructions: SYSTEM_MESSAGE,
-            modalities  : ['text', 'audio'],
-            temperature : 0.7,
+            modalities: ['text', 'audio'],
+            temperature: 0.7,
             tools: [
-              { type: 'web_search',
-                domain_allowlist: ['www.deinetuer.de', 'deinetuer.de'] }
+              {
+                type: 'web_search',
+                domain_allowlist: ['www.deinetuer.de', 'deinetuer.de']
+              }
             ],
             input_audio_transcription: { model: 'whisper-1' }
           }
@@ -84,37 +92,59 @@ export function registerWsBridge(app: FastifyInstance) {
 
       /* -------- сообщения OpenAI → Twilio -------- */
       openAiWs.on('message', raw => {
-        const msg = JSON.parse(raw.toString());
+        let msg: any;
+        try {
+          msg = JSON.parse(raw.toString());
+        } catch (e) {
+          console.error(`[${sessionId}] JSON-parse error`, e, '\nraw:', raw.toString());
+          return;
+        }
 
         if (LOG_EVENTS.has(msg.type))
           console.log(`[${sessionId}] ← OpenAI: ${msg.type}`);
+        else if (DEBUG_ALL)
+          console.log(`[${sessionId}] ← OTHER: ${msg.type}`);
 
         const s = sessions.get(sessionId);
         if (!s) return;
 
-        if (msg.type === 'conversation.item.input_audio_transcription.completed') {
-          const user = msg.transcript.trim();
-          s.transcript += `User: ${user}\n`;
-          console.log(`[${sessionId}] User: ${user}`);
+        /* --------  user transcription  -------- */
+        if (
+          msg.type === 'input.transcription.done' ||
+          msg.type === 'conversation.item.input_audio_transcription.completed'
+        ) {
+          const user = msg.transcript?.trim() || '';
+          if (user) {
+            s.transcript += `User: ${user}\n`;
+            console.log(`[${sessionId}] User: ${user}`);
+          }
         }
 
-        if (msg.type === 'response.done') {
+        /* --------  agent final text  -------- */
+        if (msg.type === 'response.complete' || msg.type === 'response.done') {
           const agent =
-            msg.response.output[0]?.content?.find((c: any) => c.transcript)
-              ?.transcript ?? '…';
+            msg.response?.output?.[0]?.content?.find((c: any) => c.transcript)?.transcript
+            ?? msg.response?.text?.[0]                          // новый формат
+            ?? '…';
           s.transcript += `Agent: ${agent}\n`;
           console.log(`[${sessionId}] Agent: ${agent}`);
         }
 
-        if (msg.type === 'response.audio.delta' && msg.delta) {
+        /* --------  audio chunk  → Twilio  ---- */
+        if ((msg.type === 'response.audio.chunk' || msg.type === 'response.audio.delta')
+          && msg.delta) {
           twilioWs.send(JSON.stringify({
-            event:'media',
+            event: 'media',
             streamSid: s.streamSid,
-            media:{ payload: msg.delta }          // delta уже base64
+            media: { payload: msg.delta }
           }));
         }
       });
 
+      /* полезно увидеть закрытие сокета и причину */
+      openAiWs.on('close', (code, reason) => {
+        console.log(`[${sessionId}] OpenAI WS closed`, code, reason.toString());
+      });
       openAiWs.on('error', err =>
         console.error(`[${sessionId}] OpenAI WS error`, err)
       );
@@ -132,14 +162,14 @@ export function registerWsBridge(app: FastifyInstance) {
           case 'media':
             if (openAiWs.readyState === WebSocket.OPEN) {
               openAiWs.send(JSON.stringify({
-                type : 'input_audio_buffer.append',
+                type: 'input_audio_buffer.append',
                 audio: evt.media.payload
               }));
             }
             break;
 
           default:
-            break; // heartbeat / dtmf
+            break; 
         }
       });
 
