@@ -14,12 +14,9 @@ const app = fastify({ logger: false });
 app.get('/healthz', () => ({ status: 'alive' }));
 app.get('/', () => ({ message: 'running' }));
 
-// Twilio entry-point ------------------------------------------
 app.all('/incoming-call', (req, reply) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <!-- убрали voice="alloy", пользуемся дефолтным голосом Twilio -->
-  <Say>Hi, you have called Bart's Automotive Centre.</Say>
   <Connect>
     <Stream url="wss://${req.headers.host}/media-stream" />
   </Connect>
@@ -27,10 +24,8 @@ app.all('/incoming-call', (req, reply) => {
   reply.type('text/xml').send(twiml);
 });
 
-// WebSocket bridge --------------------------------------------
 registerWsBridge(app);
 
-// start --------------------------------------------------------
 app.listen({ port: PORT, host: '0.0.0.0' }, err => {
   if (err) {
     console.error(err);
