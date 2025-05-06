@@ -10,7 +10,9 @@
     "dev": "nodemon --watch src --exec ts-node src/server.ts",
     "dev:ts": "ts-node src/server.ts"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/oleksandr-gridin/deinetuer_ai.git"

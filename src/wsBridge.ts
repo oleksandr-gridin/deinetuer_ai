@@ -1,6 +1,8 @@
 // src/wsBridge.ts
 import { FastifyInstance, FastifyRequest } from 'fastify';
+import type { WebSocket as FastifyWebSocket } from '@fastify/websocket';
 import { WebSocket } from 'ws';
+
 import {
   MODEL,
   SYSTEM_MESSAGE,
@@ -10,10 +12,10 @@ import {
 import { processTranscriptAndSend } from './postProcess';
 
 interface Session {
-  streamSid: string | null;
+  streamSid:  string | null;
   transcript: string;
-  openAi: WebSocket;
-  twilio: WebSocket;
+  openAi:     WebSocket;
+  twilio:     WebSocket;
 }
 
 const LOG_EVENTS = new Set([
@@ -22,69 +24,71 @@ const LOG_EVENTS = new Set([
   'conversation.item.input_audio_transcription.completed'
 ]);
 
-export function registerWsBridge(app: FastifyInstance) {
+export function registerWsBridge (app: FastifyInstance) {
 
   const sessions = new Map<string, Session>();
 
   app.get(
     '/media-stream',
     { websocket: true },
-    (twilioWs: WebSocket, req: FastifyRequest) => {
+    (connection: FastifyWebSocket, req: FastifyRequest) => {
+
+      /* ------ достаём настоящий WebSocket от Twilio ------ */
+      const twilioWs = connection;
 
       const sessionId =
         (req.headers['x-twilio-call-sid'] as string) ?? `local_${Date.now()}`;
-
       console.log(`[${sessionId}] Twilio WS connected`);
 
+      /* --------------- OpenAI realtime socket ------------- */
       const openAiWs = new WebSocket(
         `wss://api.openai.com/v1/realtime?model=${MODEL}`,
         {
           headers: {
             Authorization: `Bearer ${OPENAI_API_KEY}`,
-            'OpenAI-Beta': 'realtime=v1'
+            'OpenAI-Beta' : 'realtime=v1'
           }
         }
       );
 
-      // создаём запись о сессии
       sessions.set(sessionId, {
-        streamSid: null,
+        streamSid : null,
         transcript: '',
-        openAi: openAiWs,
-        twilio: twilioWs
+        openAi    : openAiWs,
+        twilio    : twilioWs
       });
 
+      /* ---------- когда OpenAI готов – session.update ----- */
       openAiWs.once('open', () => {
         console.log(`[${sessionId}] OpenAI WS opened`);
 
         const update = {
-          type: 'session.update',
+          type   : 'session.update',
           session: {
             turn_detection: { type: 'server_vad' },
-            input_audio_format: 'g711_ulaw',
+            input_audio_format : 'g711_ulaw',
             output_audio_format: 'g711_ulaw',
-            voice: VOICE,
+            voice       : VOICE,
             instructions: SYSTEM_MESSAGE,
-            modalities: ['text', 'audio'],
-            temperature: 0.7,
+            modalities  : ['text', 'audio'],
+            temperature : 0.7,
             tools: [
-              {
-                type: 'web_search',
-                domain_allowlist: ['www.deinetuer.de', 'deinetuer.de']
-              }
+              { type: 'web_search',
+                domain_allowlist: ['www.deinetuer.de', 'deinetuer.de'] }
             ],
             input_audio_transcription: { model: 'whisper-1' }
           }
         };
+
         openAiWs.send(JSON.stringify(update));
       });
 
-      openAiWs.on('message', (raw: Buffer) => {
+      /* ---------- сообщения от OpenAI → Twilio ------------ */
+      openAiWs.on('message', raw => {
         const msg = JSON.parse(raw.toString());
 
-        if (LOG_EVENTS.has(msg.type)) {
+        if (LOG_EVENTS.has(msg.type))
           console.log(`[${sessionId}] ← OpenAI: ${msg.type}`);
-        }
 
         const s = sessions.get(sessionId);
         if (!s) return;
@@ -103,15 +107,12 @@ export function registerWsBridge(app: FastifyInstance) {
           console.log(`[${sessionId}] Agent: ${agent}`);
         }
 
-        // аудио дельты → Twilio
         if (msg.type === 'response.audio.delta' && msg.delta) {
-          twilioWs.send(
-            JSON.stringify({
-              event: 'media',
-              streamSid: s.streamSid,
-              media: { payload: msg.delta } // delta уже base64
-            })
-          );
+          twilioWs.send(JSON.stringify({
+            event: 'media',
+            streamSid: s.streamSid,
+            media: { payload: msg.delta }          // delta уже base64
+          }));
         }
       });
 
@@ -119,7 +120,7 @@ export function registerWsBridge(app: FastifyInstance) {
         console.error(`[${sessionId}] OpenAI WS error`, err)
       );
 
-      // ---- 3. Приходят события от Twilio
+      /* ---------- сообщения от Twilio → OpenAI ------------ */
       twilioWs.on('message', buf => {
         const evt = JSON.parse(buf.toString());
 
@@ -131,21 +132,20 @@ export function registerWsBridge(app: FastifyInstance) {
 
           case 'media':
             if (openAiWs.readyState === WebSocket.OPEN) {
-              openAiWs.send(
-                JSON.stringify({
-                  type: 'input_audio_buffer.append',
-                  audio: evt.media.payload
-                })
-              );
+              openAiWs.send(JSON.stringify({
+                type: 'input_audio_buffer.append',
+                audio: evt.media.payload
+              }));
             }
             break;
 
           default:
-            // heartbeat, mark, dtmf, и т.п.
+            /* mark / dtmf / heartbeat – игнорируем */
             break;
         }
       });
 
+      /* --------------- закрытие соединения ---------------- */
       twilioWs.on('close', async () => {
         console.log(`[${sessionId}] Twilio WS closed`);
 
@@ -154,8 +154,7 @@ export function registerWsBridge(app: FastifyInstance) {
 
         const s = sessions.get(sessionId);
         if (s) {
-          console.log(`[${sessionId}] ---- FULL TRANSCRIPT ----\n` + s.transcript);
-
+          console.log(`[${sessionId}] ---- FULL TRANSCRIPT ----\n${s.transcript}`);
           await processTranscriptAndSend(s.transcript, sessionId);
           sessions.delete(sessionId);
         }
