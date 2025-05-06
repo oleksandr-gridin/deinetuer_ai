@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import fastify, { FastifyRequest, FastifyReply } from 'fastify';
 import formbody from '@fastify/formbody';
 import websocket from '@fastify/websocket';
