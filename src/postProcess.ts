@@ -1,97 +1,86 @@
-import { SYSTEM_MESSAGE, WEBHOOK_URL } from './config';
+import {
+  SYSTEM_MESSAGE,
+  WEBHOOK_URL,
+  OPENAI_API_KEY
+} from './config';
 
 interface ChatCompletion {
-  customerName: string;
+  customerName:        string;
   customerAvailability: string[];
-  specialNotes: string;
-  transcriptId?: string;
+  specialNotes:         string;
+  transcriptId?:        string;
 }
 
-const RETRY_DELAYS = [1000, 2000, 4000];
+const RETRY = [1000, 2000, 4000];
 
-export async function processTranscriptAndSend(transcript: string, id: string): Promise<void> {
+export async function processTranscriptAndSend(
+  transcript: string,
+  id: string
+): Promise<void> {
   try {
-    const completion = await withRetry(() => makeChatGPTCompletion(transcript, id));
-    if (WEBHOOK_URL) {
-      await withRetry(() => sendToWebhook(completion));
-    }
-  } catch (error) {
-    console.error(`Error processing transcript ${id}:`, error);
+    const data = await withRetry(() => makeChatGPTCompletion(transcript, id));
+    if (WEBHOOK_URL) await withRetry(() => sendToWebhook(data));
+    console.log(`[${id}] JSON sent to webhook`);
+  } catch (e) {
+    console.error(`[${id}] post-process failed:`, e);
   }
 }
 
-async function makeChatGPTCompletion(transcript: string, id: string): Promise<ChatCompletion> {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
+async function makeChatGPTCompletion(
+  transcript: string,
+  id: string
+): Promise<ChatCompletion> {
+
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method : 'POST',
     headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+      'Content-Type' : 'application/json',
+      Authorization   : `Bearer ${OPENAI_API_KEY}`
     },
     body: JSON.stringify({
       model: 'gpt-4o-2024-05-13',
       messages: [
         { role: 'system', content: SYSTEM_MESSAGE },
-        { role: 'user', content: transcript }
+        { role: 'user',   content: transcript }
       ],
       response_format: { type: 'json_object' }
     })
   });
 
-  if (!response.ok) {
-    throw new Error(`OpenAI API error: ${response.statusText}`);
-  }
+  if (!res.ok)
+    throw new Error(`OpenAI HTTP ${res.status}`);
 
-  const data = await response.json() as {
-    choices: Array<{
-      message: {
-        content: string
-      }
-    }>
-  };
-  const content = JSON.parse(data.choices[0].message.content) as {
-    customerName?: string;
-    customerAvailability?: string[];
-    specialNotes?: string;
-  };
-  
+  const json = await res.json();
+  const content = JSON.parse(json.choices[0].message.content);
+
   return {
-    customerName: content.customerName ?? 'Unknown',
+    customerName:        content.customerName        ?? 'Unknown',
     customerAvailability: content.customerAvailability ?? [],
-    specialNotes: content.specialNotes ?? '',
-    transcriptId: id
+    specialNotes:         content.specialNotes        ?? '',
+    transcriptId:         id
   };
 }
 
-async function sendToWebhook(json: ChatCompletion): Promise<void> {
-  if (!WEBHOOK_URL) {
-    throw new Error('WEBHOOK_URL is not defined');
-  }
-  const response = await fetch(WEBHOOK_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(json)
+async function sendToWebhook(payload: ChatCompletion) {
+  const r = await fetch(WEBHOOK_URL, {
+    method : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body   : JSON.stringify(payload)
   });
-
-  if (!response.ok) {
-    throw new Error(`Webhook error: ${response.statusText}`);
-  }
+  if (!r.ok) throw new Error(`Webhook HTTP ${r.status}`);
 }
 
-async function withRetry<T>(fn: () => Promise<T>, retries: number[] = RETRY_DELAYS): Promise<T> {
-  let lastError;
-  
-  for (let i = 0; i <= retries.length; i++) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      if (i < retries.length) {
-        await new Promise(resolve => setTimeout(resolve, retries[i]));
-      }
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  delays = RETRY
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i <= delays.length; i++) {
+    try { return await fn(); }
+    catch (e) {
+      lastErr = e;
+      if (i < delays.length) await new Promise(r => setTimeout(r, delays[i]));
     }
   }
-  
-  throw lastError;
+  throw lastErr;
 }

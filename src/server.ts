@@ -1,43 +1,40 @@
-import fastify, { FastifyRequest, FastifyReply } from 'fastify';
+import fastify from 'fastify';
 import formbody from '@fastify/formbody';
 import websocket from '@fastify/websocket';
 import { registerWsBridge } from './wsBridge';
-import { PORT, VOICE } from './config';
+import { PORT } from './config';
 
-const app = fastify();
+const app = fastify({ logger: false });
 
 (async () => {
   await app.register(formbody);
   await app.register(websocket);
 })();
 
-app.get('/healthz', async (): Promise<{ status: string }> => {
-  return { status: 'alive' };
-});
+app.get('/healthz', () => ({ status: 'alive' }));
+app.get('/', () => ({ message: 'running' }));
 
-app.get('/', async (): Promise<{ message: string }> => {
-  return { message: 'running' };
-});
-
-app.all('/incoming-call', async (request: FastifyRequest, reply: FastifyReply): Promise<string> => {
+// Twilio entry-point ------------------------------------------
+app.all('/incoming-call', (req, reply) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="${VOICE}">Hello, thank you for calling out door shop. How can i help you?.</Say>
+  <!-- убрали voice="alloy", пользуемся дефолтным голосом Twilio -->
+  <Say>Hi, you have called Bart's Automotive Centre.</Say>
   <Connect>
-    <Stream url="wss://${request.headers.host}/media-stream" />
+    <Stream url="wss://${req.headers.host}/media-stream" />
   </Connect>
 </Response>`;
-  
-  reply.header('Content-Type', 'text/xml');
-  return twiml;
+  reply.type('text/xml').send(twiml);
 });
 
+// WebSocket bridge --------------------------------------------
 registerWsBridge(app);
 
-app.listen({ port: PORT, host: '0.0.0.0' }, (err: Error | null) => {
+// start --------------------------------------------------------
+app.listen({ port: PORT, host: '0.0.0.0' }, err => {
   if (err) {
     console.error(err);
     process.exit(1);
   }
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Server listening on ${PORT}`);
 });
