@@ -1,4 +1,3 @@
-import fetch from 'node-fetch';
 import { SYSTEM_MESSAGE, WEBHOOK_URL } from './config';
 
 interface ChatCompletion {

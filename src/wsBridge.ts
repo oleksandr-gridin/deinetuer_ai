@@ -1,5 +1,4 @@
 import { WebSocket } from 'ws';
-import fetch from 'node-fetch';
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import { MODEL } from './config';
 import { processTranscriptAndSend } from './postProcess';
