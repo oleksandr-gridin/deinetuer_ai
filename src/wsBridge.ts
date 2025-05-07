@@ -168,9 +168,9 @@ export function registerWsBridge(app: FastifyInstance): void {
     /* ──────────────── cleanup ──────────────── */
     const cleanup = (): void => {
       if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-      processTranscriptAndSend(session.transcript, sid).catch(err =>
-        console.error(`[${sid}] post-process error:`, err)
-      );
+      // processTranscriptAndSend(session.transcript, sid).catch(err =>
+      //   console.error(`[${sid}] post-process error:`, err)
+      // );
       sessions.delete(sid);
     };
     

@@ -29,6 +29,7 @@ interface OpenAISessionUpdate {
     modalities: string[];
     temperature: number;
     input_audio_transcription: { model: string };
+    tools: Array<{ type: string, domain_allowlist: string[] }>
   };
 }
 
@@ -81,8 +82,14 @@ export function registerWsBridge(app: FastifyInstance): void {
           instructions: SYSTEM_MESSAGE,
           modalities: ['text', 'audio'],
           temperature: 0.7,
-          input_audio_transcription: { model: 'whisper-1' }
-        }
+          input_audio_transcription: { model: 'whisper-1' },
+          tools: [
+            {
+              type: 'web_search',
+              domain_allowlist: ['www.deinetuer.de', 'deinetuer.de']
+            }
+          ],
+        },
       };
       openAiWs.send(JSON.stringify(msg));
     });
@@ -125,7 +132,7 @@ export function registerWsBridge(app: FastifyInstance): void {
 
       if (
         m.type ===
-          'conversation.item.input_audio_transcription.completed' &&
+        'conversation.item.input_audio_transcription.completed' &&
         m.transcript
       ) {
         session.transcript += `User:  ${m.transcript}\n`;
@@ -154,9 +161,9 @@ export function registerWsBridge(app: FastifyInstance): void {
 
     const cleanup = () => {
       if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-      processTranscriptAndSend(session.transcript, sid).catch(err =>
-        console.error(`[${sid}] post-process error:`, err)
-      );
+      // processTranscriptAndSend(session.transcript, sid).catch(err =>
+      //   console.error(`[${sid}] post-process error:`, err)
+      // );
       sessions.delete(sid);
     };
 
@@ -172,7 +179,7 @@ export function registerWsBridge(app: FastifyInstance): void {
         wss.emit('connection', ws, req);
       });
     } else {
-      socket.destroy(); 
+      socket.destroy();
     }
   });
 }
