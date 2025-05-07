@@ -1,6 +1,7 @@
 import fastify from 'fastify';
-import { registerWsBridge } from './wsBridge';
-import { PORT } from './config';
+import { PORT } from './config.js';
+import { registerWsBridge } from './wsBridge.js';
+
 
 const app = fastify();
 

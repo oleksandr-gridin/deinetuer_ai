@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
-import { registerWsBridge } from './wsBridge';
-import { setModel, currentModel, setVoice, currentVoice, setWebSearch, webSearchEnabled } from './config';
+import { setModel, currentModel, setVoice, currentVoice, setWebSearch, webSearchEnabled } from './config.js';
+import { registerWsBridge } from './wsBridge.js';
+
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 5050;
 

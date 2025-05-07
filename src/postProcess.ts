@@ -3,7 +3,8 @@
 /*  Types                                                             */
 /* ------------------------------------------------------------------ */
 
-import { OPENAI_API_KEY, SYSTEM_MESSAGE, WEBHOOK_URL } from "./config";
+import { WEBHOOK_URL, OPENAI_API_KEY, SYSTEM_MESSAGE } from "./config.js";
+
 
 export interface ChatCompletion {
   customerName:        string;

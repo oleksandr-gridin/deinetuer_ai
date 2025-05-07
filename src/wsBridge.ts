@@ -1,9 +1,6 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { processTranscriptAndSend } from './postProcess';
-import { currentModel, currentVoice, OPENAI_API_KEY, SYSTEM_MESSAGE, webSearchEnabled } from './config';
-import { RealtimeClient } from '@openai/realtime-api-beta';
-import { ToolDefinitionType } from '@openai/realtime-api-beta/dist/lib/client';
+import { webSearchEnabled, OPENAI_API_KEY, currentModel, SYSTEM_MESSAGE, currentVoice } from './config.js';
 
 function log(sid: string, message: string, data?: any) {
   const timestamp = new Date().toISOString();
@@ -13,6 +10,17 @@ function log(sid: string, message: string, data?: any) {
     console.log(`[${timestamp}] [${sid}] ${message}`);
   }
 }
+
+type ToolDefinitionType = {
+  type: "function";
+  name: string;
+  description: string;
+  parameters: {
+    domain_allowlist: string[];
+  };
+};
+
+let RealtimeClient: typeof import('@openai/realtime-api-beta').RealtimeClient;
 
 const tools: ToolDefinitionType[] = webSearchEnabled
   ? [
@@ -30,11 +38,15 @@ const tools: ToolDefinitionType[] = webSearchEnabled
 export function registerWsBridge(app: FastifyInstance): void {
   const wss = new WebSocketServer({ noServer: true });
 
-  wss.on('connection', (ws: WebSocket, request: any) => {
+  wss.on('connection', async (ws: WebSocket, request: any) => {
     const sid = String(request.headers['x-twilio-call-sid'] ?? Date.now());
     log(sid, 'New WebSocket connection established');
 
     // --- OpenAI Realtime Client ---
+    if (!RealtimeClient) {
+      const module = await import('@openai/realtime-api-beta');
+      RealtimeClient = module.RealtimeClient;
+    }
     const client = new RealtimeClient({ apiKey: OPENAI_API_KEY });
 
     // --- Twilio → OpenAI ---
