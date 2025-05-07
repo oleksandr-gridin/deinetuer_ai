@@ -1,40 +1,178 @@
-import fastify from 'fastify';
-import formbody from '@fastify/formbody';
-import websocket from '@fastify/websocket';
-import { registerWsBridge } from './wsBridge';
-import { PORT } from './config';
+import http from 'http';
+import WebSocket, { WebSocketServer } from 'ws';
+import { FastifyInstance } from 'fastify';
+import { MODEL, OPENAI_API_KEY, VOICE, SYSTEM_MESSAGE } from './config';
+import { processTranscriptAndSend } from './postProcess';
 
-const app = fastify({ logger: false });
+interface Session {
+  ws: WebSocket;          // Twilio  ⇄ backend
+  openAiWs: WebSocket;    // backend ⇄ OpenAI
+  transcript: string;
+  streamSid?: string;
+}
 
-(async () => {
-  await app.register(formbody);
-  await app.register(websocket);
-})();
+interface TwilioMediaMessage {
+  event: 'start' | 'media' | string;
+  streamSid?: string;
+  start?: { streamSid: string };
+  media?: { payload: string };
+}
 
-app.get('/healthz', () => ({ status: 'alive' }));
-app.get('/', () => ({ message: 'running' }));
+interface OpenAISessionUpdate {
+  type: 'session.update';
+  session: {
+    turn_detection: { type: string };
+    input_audio_format: string;
+    output_audio_format: string;
+    voice: string;
+    instructions: string;
+    modalities: string[];
+    temperature: number;
+    input_audio_transcription: { model: string };
+  };
+}
 
-app.all('/incoming-call', (req, reply) => {
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://${req.headers.host}/media-stream" />
-  </Connect>
-</Response>`;
-  reply.type('text/xml').send(twiml);
-});
+interface OpenAIAudioAppend {
+  type: 'input_audio_buffer.append';
+  audio: string;
+}
 
-app.setErrorHandler((err, _req, reply) => {
-  console.error('UNCAUGHT FASTIFY ERROR:', err);
-  reply.code(500).send();
-});
+interface OpenAIMessage {
+  type: string;
+  transcript?: string;
+  response?: {
+    output?: Array<{
+      content?: Array<{ transcript?: string }>;
+    }>;
+  };
+  delta?: string;
+}
 
-registerWsBridge(app);
 
-app.listen({ port: PORT, host: '0.0.0.0' }, err => {
-  if (err) {
-    console.error(err);
-    process.exit(1);
-  }
-  console.log(`Server listening on ${PORT}`);
-});
+const sessions = new Map<string, Session>();
+
+export function registerWsBridge(app: FastifyInstance): void {
+  const wss = new WebSocketServer({ noServer: true });
+
+  wss.on('connection', (twilioSocket: WebSocket, req: http.IncomingMessage) => {
+    const sid = String(req.headers['x-twilio-call-sid'] ?? Date.now());
+
+    const openAiWs = new WebSocket(
+      `wss://api.openai.com/v1/realtime?model=${MODEL}`,
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'OpenAI-Beta': 'realtime=v1'
+        }
+      }
+    );
+
+    const session: Session = { ws: twilioSocket, openAiWs, transcript: '' };
+    sessions.set(sid, session);
+
+    openAiWs.once('open', () => {
+      const msg: OpenAISessionUpdate = {
+        type: 'session.update',
+        session: {
+          turn_detection: { type: 'server_vad' },
+          input_audio_format: 'g711_ulaw',
+          output_audio_format: 'g711_ulaw',
+          voice: VOICE,
+          instructions: SYSTEM_MESSAGE,
+          modalities: ['text', 'audio'],
+          temperature: 0.7,
+          input_audio_transcription: { model: 'whisper-1' }
+        }
+      };
+      openAiWs.send(JSON.stringify(msg));
+    });
+
+    twilioSocket.on('message', raw => {
+      let msg: TwilioMediaMessage;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      switch (msg.event) {
+        case 'start':
+          session.streamSid = msg.start?.streamSid;
+          break;
+
+        case 'media':
+          if (
+            openAiWs.readyState === WebSocket.OPEN &&
+            msg.media?.payload
+          ) {
+            const append: OpenAIAudioAppend = {
+              type: 'input_audio_buffer.append',
+              audio: msg.media.payload
+            };
+            openAiWs.send(JSON.stringify(append));
+          }
+          break;
+      }
+    });
+
+    openAiWs.on('message', data => {
+      let m: OpenAIMessage;
+      try {
+        m = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+
+      if (
+        m.type ===
+          'conversation.item.input_audio_transcription.completed' &&
+        m.transcript
+      ) {
+        session.transcript += `User:  ${m.transcript}\n`;
+      }
+
+      if (m.type === 'response.done') {
+        const agent = m.response?.output?.[0]?.content?.find(
+          c => c.transcript
+        )?.transcript;
+        if (agent) session.transcript += `Agent: ${agent}\n`;
+      }
+
+      if (
+        m.type === 'response.audio.delta' &&
+        m.delta &&
+        session.streamSid
+      ) {
+        const twMsg: TwilioMediaMessage = {
+          event: 'media',
+          streamSid: session.streamSid,
+          media: { payload: m.delta }
+        };
+        twilioSocket.send(JSON.stringify(twMsg));
+      }
+    });
+
+    const cleanup = () => {
+      if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+      processTranscriptAndSend(session.transcript, sid).catch(err =>
+        console.error(`[${sid}] post-process error:`, err)
+      );
+      sessions.delete(sid);
+    };
+
+    twilioSocket.on('close', cleanup);
+    twilioSocket.on('error', cleanup);
+    openAiWs.on('close', cleanup);
+    openAiWs.on('error', cleanup);
+  });
+
+  app.server.on('upgrade', (req, socket, head) => {
+    if (req.url === '/media-stream') {
+      wss.handleUpgrade(req, socket, head, ws => {
+        wss.emit('connection', ws, req);
+      });
+    } else {
+      socket.destroy(); 
+    }
+  });
+}
