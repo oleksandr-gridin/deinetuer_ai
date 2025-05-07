@@ -150,9 +150,15 @@ export function registerWsBridge(app: FastifyInstance) {
       );
       const wd = setTimeout(() => {
         console.warn(`[${sessionId}] WATCHDOG 5s: no start/media — closing`);
-        twilioWs.close(1000, 'no start or media');
-      }, 5000);
+        const sock: any = connection.socket;
 
+        if (typeof sock.close === 'function') 
+          sock.close(1000, 'no start or media');
+        else if (typeof sock.terminate === 'function')
+          sock.terminate();
+        else if (typeof sock.end === 'function') 
+          sock.end();
+      }, 5000);
       /* ――― первый пакет ――― */
       let gotStart = false;
 
