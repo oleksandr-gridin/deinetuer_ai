@@ -53,7 +53,6 @@ export function registerWsBridge(app: FastifyInstance): void {
       let msg;
       try {
         msg = JSON.parse(raw.toString());
-        log(sid, `Received message from Twilio: ${msg.event}`, msg);
       } catch (err) {
         log(sid, 'Error parsing Twilio message', { error: err, raw: raw.toString() });
         return;
@@ -88,22 +87,22 @@ export function registerWsBridge(app: FastifyInstance): void {
                 tools,
               };
               console.log(`[${sid}] OpenAI WS opened`);
-              openaiWs!.send(JSON.stringify({
-                type: 'session.update',
-                session: sessionConfig
-              }));
-
-              if (mediaBuffer.length > 0) {
-                for (const frame of mediaBuffer) {
-                  openaiWs!.send(frame);
+              setTimeout(() => {
+                openaiWs!.send(JSON.stringify({
+                  type: 'session.update',
+                  session: sessionConfig
+                }));
+                if (mediaBuffer.length > 0) {
+                  for (const frame of mediaBuffer) {
+                    openaiWs!.send(frame);
+                  }
+                  mediaBuffer = [];
                 }
-                mediaBuffer = [];
-              }
-
-              if (stopReceived) {
-                openaiWs!.send(JSON.stringify({ type: 'input_audio_buffer.end' }));
-                setTimeout(() => openaiWs?.close(), 500);
-              }
+                if (stopReceived) {
+                  openaiWs!.send(JSON.stringify({ type: 'input_audio_buffer.end' }));
+                  setTimeout(() => openaiWs?.close(), 500);
+                }
+              }, 250);
             });
 
             openaiWs.on('message', (data) => {
@@ -114,6 +113,7 @@ export function registerWsBridge(app: FastifyInstance): void {
                 console.error(`[${sid}] Error parsing OpenAI message`, err);
                 return;
               }
+              console.log(`[${sid}] OpenAI event:`, event);
 
               // 1. Транскрипция текста
               if (event.type === 'conversation.item.input_audio_transcription.completed' && event.transcript) {
@@ -190,7 +190,7 @@ export function registerWsBridge(app: FastifyInstance): void {
   // WebSocket upgrade
   app.server.on('upgrade', (request, socket, head) => {
     const url = new URL(request.url || '', `http://${request.headers.host}`);
-    log('system','URL FROM MESSAGE', url)
+    log('system', 'URL FROM MESSAGE', url)
     log('system', 'WebSocket upgrade request', { path: url.pathname });
 
     if (url.pathname === '/media-stream') {
