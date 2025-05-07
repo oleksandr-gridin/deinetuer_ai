@@ -87,7 +87,8 @@ export function registerWsBridge(app: FastifyInstance): void {
         case 'media':
           if (client.isConnected()) {
             const audioBuf = Buffer.from(msg.media.payload, 'base64');
-            client.appendInputAudio(audioBuf);
+            const audioUint8 = new Uint8Array(audioBuf.buffer, audioBuf.byteOffset, audioBuf.byteLength);
+            client.appendInputAudio(audioUint8);
           }
           break;
 
