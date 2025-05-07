@@ -10,7 +10,24 @@ type ToolDefinitionType = {
     domain_allowlist: string[];
   };
 };
-const tools = webSearchEnabled ? ["web_search"] : [];
+const webSearchTool = {
+  type: "function",
+  function: {
+    name: "web_search",
+    description: "Search the web and return relevant results",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Search phrase to look up on the web"
+        }
+      },
+      required: ["query"]
+    }
+  }
+};
+const tools = webSearchEnabled ? [webSearchTool] : [];
 
 function log(sid: string, message: string, data?: any) {
   const timestamp = new Date().toISOString();
