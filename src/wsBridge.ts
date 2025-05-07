@@ -13,15 +13,15 @@ type ToolDefinitionType = {
 
 const tools: ToolDefinitionType[] = webSearchEnabled
   ? [
-      {
-        type: "function",
-        name: "web_search",
-        description: "Searches the web for information within allowed domains.",
-        parameters: {
-          domain_allowlist: ["https://deinetuer.de", "deinetuer.de"]
-        }
+    {
+      type: "function",
+      name: "web_search",
+      description: "Searches the web for information within allowed domains.",
+      parameters: {
+        domain_allowlist: ["https://deinetuer.de", "deinetuer.de"]
       }
-    ]
+    }
+  ]
   : [];
 
 function log(sid: string, message: string, data?: any) {
@@ -46,6 +46,7 @@ export function registerWsBridge(app: FastifyInstance): void {
     let openaiReady = false;
     let mediaBuffer: any[] = [];
     let sessionConfig: any = null;
+    let stopReceived = false;
 
     // --- Twilio → OpenAI ---
     ws.on('message', async (raw) => {
@@ -62,9 +63,7 @@ export function registerWsBridge(app: FastifyInstance): void {
         case 'start':
           if (msg.start) {
             streamSid = msg.start.streamSid;
-            log(sid, 'Stream started', { streamSid });
 
-            // --- Открываем WebSocket к OpenAI ---
             openaiWs = new WebSocket(
               `wss://api.openai.com/v1/realtime?model=${currentModel}`,
               {
@@ -88,19 +87,22 @@ export function registerWsBridge(app: FastifyInstance): void {
                 temperature: 0.7,
                 tools,
               };
-              log(sid, 'Sending session.update to OpenAI', sessionConfig);
+              console.log(`[${sid}] OpenAI WS opened`);
               openaiWs!.send(JSON.stringify({
                 type: 'session.update',
                 session: sessionConfig
               }));
 
-              // Отправляем буфер аудиофреймов, если был накоплен
               if (mediaBuffer.length > 0) {
-                log(sid, `Flushing ${mediaBuffer.length} buffered audio frames to OpenAI`);
                 for (const frame of mediaBuffer) {
                   openaiWs!.send(frame);
                 }
                 mediaBuffer = [];
+              }
+
+              if (stopReceived) {
+                openaiWs!.send(JSON.stringify({ type: 'input_audio_buffer.end' }));
+                setTimeout(() => openaiWs?.close(), 500);
               }
             });
 
@@ -109,39 +111,28 @@ export function registerWsBridge(app: FastifyInstance): void {
               try {
                 event = JSON.parse(data.toString());
               } catch (err) {
-                log(sid, 'Error parsing OpenAI message', { error: err, raw: data.toString() });
+                console.error(`[${sid}] Error parsing OpenAI message`, err);
                 return;
               }
 
+              // 1. Транскрипция текста
               if (event.type === 'conversation.item.input_audio_transcription.completed' && event.transcript) {
-                transcript += `User:  ${event.transcript}\n`;
-                log(sid, `User: ${event.transcript}`);
+                console.log(`[${sid}] User: ${event.transcript}`);
               }
-
               if (event.type === 'response.done') {
                 const agent = event.response?.output?.[0]?.content?.find((c: any) => c.transcript)?.transcript;
                 if (agent) {
-                  transcript += `Agent: ${agent}\n`;
-                  log(sid, `Agent: ${agent}`);
+                  console.log(`[${sid}] Agent: ${agent}`);
                 }
-              }
-
-              if (event.type === 'response.audio.delta' && event.delta && streamSid) {
-                ws.send(JSON.stringify({
-                  event: 'media',
-                  streamSid,
-                  media: { payload: event.delta }
-                }));
               }
             });
 
             openaiWs.on('close', () => {
-              log(sid, 'OpenAI WebSocket closed');
               openaiReady = false;
               openaiWs = null;
             });
             openaiWs.on('error', (err) => {
-              log(sid, 'OpenAI WebSocket error', err);
+              console.error(`[${sid}] OpenAI WebSocket error`, err);
               openaiReady = false;
               openaiWs = null;
             });
@@ -157,11 +148,11 @@ export function registerWsBridge(app: FastifyInstance): void {
             openaiWs.send(appendMsg);
           } else {
             mediaBuffer.push(appendMsg);
-            log(sid, 'Buffering audio frame, OpenAI WS not ready', { bufferLength: mediaBuffer.length });
           }
           break;
 
         case 'stop':
+          stopReceived = true;
           if (openaiReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.end' }));
             setTimeout(() => openaiWs?.close(), 500);
