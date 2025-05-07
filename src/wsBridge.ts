@@ -190,6 +190,7 @@ export function registerWsBridge(app: FastifyInstance): void {
   // WebSocket upgrade
   app.server.on('upgrade', (request, socket, head) => {
     const url = new URL(request.url || '', `http://${request.headers.host}`);
+    log('system','URL FROM MESSAGE', url)
     log('system', 'WebSocket upgrade request', { path: url.pathname });
 
     if (url.pathname === '/media-stream') {
