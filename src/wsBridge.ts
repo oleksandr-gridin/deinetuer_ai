@@ -148,34 +148,49 @@ export function registerWsBridge(app: FastifyInstance) {
       openAiWs.on('error', err =>
         console.error(`[${sessionId}] OpenAI WS error`, err)
       );
+      const wd = setTimeout(() => {
+        console.warn(`[${sessionId}] WATCHDOG 5s: no start/media — closing`);
+        twilioWs.close(1000, 'no start or media');
+      }, 5000);
+
+      /* ――― первый пакет ――― */
+      let gotStart = false;
 
       /* -------- сообщения Twilio → OpenAI -------- */
       twilioWs.on('message', buf => {
         const evt = JSON.parse(buf.toString());
 
-        switch (evt.event) {
-          case 'start':
-            sessions.get(sessionId)!.streamSid = evt.start.streamSid;
-            console.log(`[${sessionId}] Twilio stream started`);
-            break;
-
-          case 'media':
-            if (openAiWs.readyState === WebSocket.OPEN) {
-              openAiWs.send(JSON.stringify({
-                type: 'input_audio_buffer.append',
-                audio: evt.media.payload
-              }));
-            }
-            break;
-
-          default:
-            break; 
+        /* ---------- start ---------- */
+        if (evt.event === 'start') {
+          clearTimeout(wd);                  // NEW
+          gotStart = true;                   // NEW
+          sessions.get(sessionId)!.streamSid = evt.start.streamSid;
+          console.log(`[${sessionId}] Twilio stream started`);
+          return;
         }
-      });
+
+        /* ---------- media ---------- */
+        if (evt.event === 'media') {
+          if (!gotStart) {                   // NEW
+            clearTimeout(wd);
+            gotStart = true;
+            sessions.get(sessionId)!.streamSid = evt.streamSid; // media-вариант
+            console.warn(`[${sessionId}] start missing ⇒ adopted streamSid from media`);
+          }
+          if (openAiWs.readyState === WebSocket.OPEN) {
+            openAiWs.send(JSON.stringify({
+              type: 'input_audio_buffer.append',
+              audio: evt.media.payload
+            }));
+          }
+          return;
+        }
+      })
 
       /* -------- закрываем соединение -------- */
-      twilioWs.on('close', async () => {
+      twilioWs.on('close', async (reason, code) => {
         console.log(`[${sessionId}] Twilio WS closed`);
+        console.log(`[${sessionId}] Twilio WS closed`, code, reason.toString());
 
         if (openAiWs.readyState <= WebSocket.CLOSING)
           openAiWs.terminate();
