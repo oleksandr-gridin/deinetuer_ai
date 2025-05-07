@@ -93,7 +93,7 @@ export function registerWsBridge(app: FastifyInstance): void {
 
         case 'stop':
           if (client.isConnected()) {
-            await client.createResponse(); // коммитим аудио
+            await client.createResponse(); // commit audio
             await client.disconnect();
           }
           break;
@@ -101,13 +101,13 @@ export function registerWsBridge(app: FastifyInstance): void {
     });
 
     // --- OpenAI → Twilio + transcript ---
-    client.on('conversation.updated', ({ item, delta }) => {
+    client.on('conversation.updated', ({ delta }: { delta: { transcript?: string; response?: { output?: Array<{ content?: Array<{ transcript?: string }> }> }; audio?: Uint8Array } }) => {
       if (delta?.transcript) {
         transcript += `User:  ${delta.transcript}\n`;
         log(sid, `User: ${delta.transcript}`);
       }
       if (delta?.response?.output) {
-        const agent = delta.response.output[0]?.content?.find(c => c.transcript)?.transcript;
+        const agent = delta.response.output[0]?.content?.find((c: { transcript?: string }) => c.transcript)?.transcript;
         if (agent) {
           transcript += `Agent: ${agent}\n`;
           log(sid, `Agent: ${agent}`);
@@ -128,7 +128,7 @@ export function registerWsBridge(app: FastifyInstance): void {
       if (client.isConnected()) {
         client.disconnect()
       }
-      // Можно раскомментировать для post-processing:
+      // Uncomment for post-processing:
       // processTranscriptAndSend(transcript, sid).catch(err => {
       //   log(sid, 'Post-process error', err);
       // });
@@ -143,7 +143,7 @@ export function registerWsBridge(app: FastifyInstance): void {
       log(sid, 'Twilio WebSocket error', err);
       cleanup();
     });
-    client.on('error', (err) => {
+    client.on('error', (err: any) => {
       log(sid, 'OpenAI Client error', err);
       cleanup();
     });

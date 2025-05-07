@@ -3,18 +3,18 @@ import 'dotenv/config';
 export const PORT = Number(process.env.PORT) || 5050;
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 export const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
-
+export type voiceType = "alloy" | "ash" | "ballad" | "coral" | "echo" | "sage" | "shimmer" | "verse";
 export let currentModel = 'gpt-4o-realtime-preview-2024-10-01';
-export let currentVoice: "alloy" | "ash" | "ballad" | "coral" | "echo" | "sage" | "shimmer" | "verse" = 'alloy';
+export let currentVoice:voiceType = 'alloy';
 export let webSearchEnabled = true;
 
-export function setModel(model) {
+export function setModel(model: string) {
     currentModel = model;
 }
-export function setVoice(voice) {
+export function setVoice(voice: voiceType) {
     currentVoice = voice;
 }
-export function setWebSearch(enabled) {
+export function setWebSearch(enabled: boolean) {
     webSearchEnabled = enabled;
 }
 

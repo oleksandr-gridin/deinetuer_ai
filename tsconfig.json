@@ -6,7 +6,9 @@
     "moduleDetection": "force",
     "outDir": "dist",
     "esModuleInterop": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true
   },
   "include": [
     "src"

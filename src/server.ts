@@ -1,5 +1,5 @@
 import Fastify from 'fastify';
-import { setModel, currentModel, setVoice, currentVoice, setWebSearch, webSearchEnabled } from './config.js';
+import { setModel, currentModel, setVoice, currentVoice, setWebSearch, webSearchEnabled, voiceType } from './config.js';
 import { registerWsBridge } from './wsBridge.js';
 
 
@@ -40,7 +40,7 @@ app.patch('/model', async (request, reply) => {
 
 // PATCH /voice
 app.patch('/voice', async (request, reply) => {
-  const { voice } = request.body as { voice: string };
+  const { voice } = request.body as { voice: voiceType };
   if (!['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'].includes(voice)) {
     return reply.code(400).send({ error: 'Invalid voice' });
   }
