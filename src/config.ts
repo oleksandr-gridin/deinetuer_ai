@@ -5,7 +5,7 @@ export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 export const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 
 export let currentModel = 'gpt-4o-realtime-preview-2024-10-01';
-export let currentVoice = 'alloy';
+export let currentVoice: "alloy" | "ash" | "ballad" | "coral" | "echo" | "sage" | "shimmer" | "verse" = 'alloy';
 export let webSearchEnabled = true;
 
 export function setModel(model) {

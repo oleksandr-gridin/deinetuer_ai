@@ -1,7 +1,9 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { processTranscriptAndSend } from './postProcess';
-import { currentModel, currentVoice, OPENAI_API_KEY, SYSTEM_MESSAGE } from './config';
+import { currentModel, currentVoice, OPENAI_API_KEY, SYSTEM_MESSAGE, webSearchEnabled } from './config';
+import { RealtimeClient } from '@openai/realtime-api-beta';
+import { ToolDefinitionType } from '@openai/realtime-api-beta/dist/lib/client';
 
 function log(sid: string, message: string, data?: any) {
   const timestamp = new Date().toISOString();
@@ -12,16 +14,18 @@ function log(sid: string, message: string, data?: any) {
   }
 }
 
-interface Session {
-  ws: WebSocket; // Twilio <-> backend
-  openAiWs: WebSocket; // backend <-> OpenAI
-  transcript: string;
-  streamSid?: string;
-  mediaBuffer: string[]; // буфер аудиофреймов
-  openAiReady: boolean;
-}
-
-const sessions = new Map<string, Session>();
+const tools: ToolDefinitionType[] = webSearchEnabled
+  ? [
+    {
+      type: "function",
+      name: "web_search",
+      description: "Searches the web for information within allowed domains.",
+      parameters: {
+        domain_allowlist: ["https://deinetuer.de", "deinetuer.de"]
+      }
+    }
+  ]
+  : [];
 
 export function registerWsBridge(app: FastifyInstance): void {
   const wss = new WebSocketServer({ noServer: true });
@@ -30,58 +34,14 @@ export function registerWsBridge(app: FastifyInstance): void {
     const sid = String(request.headers['x-twilio-call-sid'] ?? Date.now());
     log(sid, 'New WebSocket connection established');
 
-    // OpenAI WebSocket
-    const openAiWs = new WebSocket(
-      `wss://api.openai.com/v1/realtime?model=${currentModel}`,
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'OpenAI-Beta': 'realtime=v1'
-        }
-      }
-    );
-    log(sid, 'Creating OpenAI WebSocket connection');
-
-    const session: Session = {
-      ws,
-      openAiWs,
-      transcript: '',
-      mediaBuffer: [],
-      openAiReady: false
-    };
-    sessions.set(sid, session);
-
-    openAiWs.once('open', () => {
-      session.openAiReady = true;
-      log(sid, 'OpenAI WebSocket connection opened');
-      const msg = {
-        type: 'session.update',
-        session: {
-          turn_detection: { type: 'server_vad' },
-          input_audio_format: 'g711_ulaw',
-          output_audio_format: 'g711_ulaw',
-          voice: currentVoice,
-          instructions: SYSTEM_MESSAGE,
-          modalities: ['text', 'audio'],
-          temperature: 0.7,
-          input_audio_transcription: { model: 'whisper-1' }
-        }
-      };
-      log(sid, 'Sending session update to OpenAI');
-      openAiWs.send(JSON.stringify(msg));
-
-      // Отправить все накопленные аудиофреймы
-      if (session.mediaBuffer.length > 0) {
-        log(sid, `Flushing ${session.mediaBuffer.length} buffered audio frames to OpenAI`);
-        for (const frame of session.mediaBuffer) {
-          openAiWs.send(frame);
-        }
-        session.mediaBuffer = [];
-      }
-    });
+    // --- OpenAI Realtime Client ---
+    const client = new RealtimeClient({ apiKey: OPENAI_API_KEY });
 
     // --- Twilio → OpenAI ---
-    ws.on('message', (raw) => {
+    let streamSid: string | undefined;
+    let transcript = '';
+
+    ws.on('message', async (raw) => {
       let msg;
       try {
         msg = JSON.parse(raw.toString());
@@ -94,57 +54,58 @@ export function registerWsBridge(app: FastifyInstance): void {
       switch (msg.event) {
         case 'start':
           if (msg.start) {
-            session.streamSid = msg.start.streamSid;
-            log(sid, 'Stream started', { streamSid: session.streamSid });
+            streamSid = msg.start.streamSid;
+            log(sid, 'Stream started', { streamSid });
+            await client.updateSession({
+              model: currentModel,
+              instructions: SYSTEM_MESSAGE,
+              voice: currentVoice,
+              turn_detection: { type: 'server_vad' },
+              input_audio_transcription: { model: 'whisper-1' },
+              input_audio_format: 'g711_ulaw',
+              output_audio_format: 'g711_ulaw',
+              modalities: ['text', 'audio'],
+              temperature: 0.7,
+              tools
+            });
+            await client.connect();
           }
           break;
 
         case 'media':
-          const appendMsg = JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: msg.media.payload
-          });
-          if (session.openAiReady && openAiWs.readyState === WebSocket.OPEN) {
-            openAiWs.send(appendMsg);
-          } else {
-            session.mediaBuffer.push(appendMsg);
-            log(sid, 'Buffering audio frame, OpenAI WS not ready', { bufferLength: session.mediaBuffer.length });
+          if (client.isConnected()) {
+            const audioBuf = Buffer.from(msg.media.payload, 'base64');
+            client.appendInputAudio(audioBuf);
+          }
+          break;
+
+        case 'stop':
+          if (client.isConnected()) {
+            await client.createResponse(); // коммитим аудио
+            await client.disconnect();
           }
           break;
       }
     });
 
     // --- OpenAI → Twilio + transcript ---
-    openAiWs.on('message', (data) => {
-      let m;
-      try {
-        m = JSON.parse(data.toString());
-      } catch (err) {
-        log(sid, 'Error parsing OpenAI message', { error: err, raw: data.toString() });
-        return;
+    client.on('conversation.updated', ({ item, delta }) => {
+      if (delta?.transcript) {
+        transcript += `User:  ${delta.transcript}\n`;
+        log(sid, `User: ${delta.transcript}`);
       }
-
-      // Логируем каждую реплику пользователя
-      if (m.type === 'conversation.item.input_audio_transcription.completed' && m.transcript) {
-        session.transcript += `User:  ${m.transcript}\n`;
-        log(sid, `User: ${m.transcript}`);
-      }
-
-      // Логируем каждую реплику агента
-      if (m.type === 'response.done') {
-        const agent = m.response?.output?.[0]?.content?.find(c => c.transcript)?.transcript;
+      if (delta?.response?.output) {
+        const agent = delta.response.output[0]?.content?.find(c => c.transcript)?.transcript;
         if (agent) {
-          session.transcript += `Agent: ${agent}\n`;
+          transcript += `Agent: ${agent}\n`;
           log(sid, `Agent: ${agent}`);
         }
       }
-
-      // Аудио-ответ агента
-      if (m.type === 'response.audio.delta' && m.delta && session.streamSid) {
+      if (delta?.audio && streamSid) {
         ws.send(JSON.stringify({
           event: 'media',
-          streamSid: session.streamSid,
-          media: { payload: m.delta }
+          streamSid,
+          media: { payload: Buffer.from(delta.audio).toString('base64') }
         }));
       }
     });
@@ -152,16 +113,14 @@ export function registerWsBridge(app: FastifyInstance): void {
     // --- cleanup ---
     const cleanup = () => {
       log(sid, 'Starting cleanup');
-      if (openAiWs.readyState === WebSocket.OPEN) {
-        log(sid, 'Closing OpenAI WebSocket');
-        openAiWs.close();
+      if (client.isConnected()) {
+        client.disconnect()
       }
       // Можно раскомментировать для post-processing:
-      // processTranscriptAndSend(session.transcript, sid).catch(err => {
+      // processTranscriptAndSend(transcript, sid).catch(err => {
       //   log(sid, 'Post-process error', err);
       // });
-      sessions.delete(sid);
-      log(sid, 'Session cleaned up', { transcriptLength: session.transcript.length });
+      log(sid, 'Session cleaned up', { transcriptLength: transcript.length });
     };
 
     ws.on('close', () => {
@@ -172,12 +131,12 @@ export function registerWsBridge(app: FastifyInstance): void {
       log(sid, 'Twilio WebSocket error', err);
       cleanup();
     });
-    openAiWs.on('close', () => {
-      log(sid, 'OpenAI WebSocket closed');
+    client.on('error', (err) => {
+      log(sid, 'OpenAI Client error', err);
       cleanup();
     });
-    openAiWs.on('error', (err) => {
-      log(sid, 'OpenAI WebSocket error', err);
+    client.on('close', () => {
+      log(sid, 'OpenAI Client closed');
       cleanup();
     });
   });
