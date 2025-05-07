@@ -10,19 +10,7 @@ type ToolDefinitionType = {
     domain_allowlist: string[];
   };
 };
-
-const tools: ToolDefinitionType[] = webSearchEnabled
-  ? [
-    {
-      type: "function",
-      name: "web_search",
-      description: "Searches the web for information within allowed domains.",
-      parameters: {
-        domain_allowlist: ["https://deinetuer.de", "deinetuer.de"]
-      }
-    }
-  ]
-  : [];
+const tools = webSearchEnabled ? ["web_search"] : [];
 
 function log(sid: string, message: string, data?: any) {
   const timestamp = new Date().toISOString();
