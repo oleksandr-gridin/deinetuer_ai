@@ -1,7 +1,7 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { processTranscriptAndSend } from './postProcess';
-import { webSearchEnabled, currentModel, OPENAI_API_KEY, currentVoice, SYSTEM_MESSAGE } from './config';
+import { currentModel, currentVoice, OPENAI_API_KEY, SYSTEM_MESSAGE } from './config';
 
 function log(sid: string, message: string, data?: any) {
   const timestamp = new Date().toISOString();
@@ -17,12 +17,11 @@ interface Session {
   openAiWs: WebSocket; // backend <-> OpenAI
   transcript: string;
   streamSid?: string;
+  mediaBuffer: string[]; // буфер аудиофреймов
+  openAiReady: boolean;
 }
 
 const sessions = new Map<string, Session>();
-const tools = webSearchEnabled
-  ? [{ type: 'web_search', domain_allowlist: [] }]
-  : [];
 
 export function registerWsBridge(app: FastifyInstance): void {
   const wss = new WebSocketServer({ noServer: true });
@@ -43,10 +42,17 @@ export function registerWsBridge(app: FastifyInstance): void {
     );
     log(sid, 'Creating OpenAI WebSocket connection');
 
-    const session: Session = { ws, openAiWs, transcript: '' };
+    const session: Session = {
+      ws,
+      openAiWs,
+      transcript: '',
+      mediaBuffer: [],
+      openAiReady: false
+    };
     sessions.set(sid, session);
 
     openAiWs.once('open', () => {
+      session.openAiReady = true;
       log(sid, 'OpenAI WebSocket connection opened');
       const msg = {
         type: 'session.update',
@@ -58,12 +64,20 @@ export function registerWsBridge(app: FastifyInstance): void {
           instructions: SYSTEM_MESSAGE,
           modalities: ['text', 'audio'],
           temperature: 0.7,
-          input_audio_transcription: { model: 'whisper-1' },
-          tools
+          input_audio_transcription: { model: 'whisper-1' }
         }
       };
       log(sid, 'Sending session update to OpenAI');
       openAiWs.send(JSON.stringify(msg));
+
+      // Отправить все накопленные аудиофреймы
+      if (session.mediaBuffer.length > 0) {
+        log(sid, `Flushing ${session.mediaBuffer.length} buffered audio frames to OpenAI`);
+        for (const frame of session.mediaBuffer) {
+          openAiWs.send(frame);
+        }
+        session.mediaBuffer = [];
+      }
     });
 
     // --- Twilio → OpenAI ---
@@ -86,14 +100,15 @@ export function registerWsBridge(app: FastifyInstance): void {
           break;
 
         case 'media':
-          if (openAiWs.readyState === WebSocket.OPEN && msg.media?.payload) {
-            openAiWs.send(JSON.stringify({
-              type: 'input_audio_buffer.append',
-              audio: msg.media.payload
-            }));
-            log(sid, 'Forwarded media to OpenAI', { payloadLength: msg.media.payload.length });
+          const appendMsg = JSON.stringify({
+            type: 'input_audio_buffer.append',
+            audio: msg.media.payload
+          });
+          if (session.openAiReady && openAiWs.readyState === WebSocket.OPEN) {
+            openAiWs.send(appendMsg);
           } else {
-            log(sid, 'Cannot forward media - OpenAI WS not ready', { readyState: openAiWs.readyState });
+            session.mediaBuffer.push(appendMsg);
+            log(sid, 'Buffering audio frame, OpenAI WS not ready', { bufferLength: session.mediaBuffer.length });
           }
           break;
       }
@@ -109,13 +124,13 @@ export function registerWsBridge(app: FastifyInstance): void {
         return;
       }
 
-      // Log of every replica of user
+      // Логируем каждую реплику пользователя
       if (m.type === 'conversation.item.input_audio_transcription.completed' && m.transcript) {
         session.transcript += `User:  ${m.transcript}\n`;
         log(sid, `User: ${m.transcript}`);
       }
 
-      // Log of every replica of agent
+      // Логируем каждую реплику агента
       if (m.type === 'response.done') {
         const agent = m.response?.output?.[0]?.content?.find(c => c.transcript)?.transcript;
         if (agent) {
@@ -124,7 +139,7 @@ export function registerWsBridge(app: FastifyInstance): void {
         }
       }
 
-      // Audio response
+      // Аудио-ответ агента
       if (m.type === 'response.audio.delta' && m.delta && session.streamSid) {
         ws.send(JSON.stringify({
           event: 'media',
@@ -141,7 +156,7 @@ export function registerWsBridge(app: FastifyInstance): void {
         log(sid, 'Closing OpenAI WebSocket');
         openAiWs.close();
       }
-      //  post-processing:
+      // Можно раскомментировать для post-processing:
       // processTranscriptAndSend(session.transcript, sid).catch(err => {
       //   log(sid, 'Post-process error', err);
       // });
@@ -167,7 +182,7 @@ export function registerWsBridge(app: FastifyInstance): void {
     });
   });
 
-  // HTTP-trap for calling /media-stream via http
+  // HTTP-заглушка для /media-stream
   app.get('/media-stream', (req: FastifyRequest, reply: FastifyReply) => {
     log('system', 'HTTP request to WebSocket endpoint', { method: req.method, url: req.url });
     reply.raw.writeHead(400);
