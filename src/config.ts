@@ -1,13 +1,23 @@
 import 'dotenv/config';
 
-/* ───── runtime variables ───── */
 export const PORT = Number(process.env.PORT) || 5050;
-export const OPENAI_API_KEY=process.env.OPENAI_API_KEY|| '';
-export const WEBHOOK_URL=process.env.WEBHOOK_URL   || '';
+export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+export const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 
-/* ───── OpenAI realtime settings ───── */
-export const MODEL = process.env.OPENAI_MODEL ?? 'gpt-4o-realtime-preview-2024-10-01';
-export const VOICE = process.env.VOICE ?? 'alloy';
+export let currentModel = 'gpt-4o-realtime-preview-2024-10-01';
+export let currentVoice = 'alloy';
+export let webSearchEnabled = true;
+
+export function setModel(model) {
+    currentModel = model;
+}
+export function setVoice(voice) {
+    currentVoice = voice;
+}
+export function setWebSearch(enabled) {
+    webSearchEnabled = enabled;
+}
+
 
 /* ───── system prompt for the agent ───── */
 export const SYSTEM_MESSAGE = `
