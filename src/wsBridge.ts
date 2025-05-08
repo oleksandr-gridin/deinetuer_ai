@@ -163,6 +163,7 @@ function handleTwilio(s: Session, raw: RawData) {
 
 function openOpenAI(s: Session) {
   if (s.openai) return;
+
   const ws = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${currentModel}`,
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
@@ -176,8 +177,15 @@ function openOpenAI(s: Session) {
   });
 
   ws.on('message', (d) => handleOpenAI(s, d));
-  ws.on('close', () => closeSession(s, 'openai closed'));
-  ws.on('error', () => closeSession(s, 'openai error'));
+
+  ws.on('close', () => {
+    log(s.streamSid, 'OpenAI closed - wait for timeout');
+    s.openai = undefined;
+  });
+  ws.on('error', (e) => {
+    log(s.streamSid, `OpenAI error: ${(e as Error).message}`);
+    s.openai = undefined;
+  });
 }
 
 function commitAudio(s: Session) {
