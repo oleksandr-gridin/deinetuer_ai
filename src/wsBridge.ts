@@ -57,6 +57,8 @@ export function registerWsBridge(app: FastifyInstance): void {
     let mediaBuffer: any[] = [];
     let sessionConfig: any = null;
     let stopReceived = false;
+    let awaitingResponse = false;
+    let responseTimeout: NodeJS.Timeout | null = null;
 
     ws.on('message', async (raw) => {
       let msg;
@@ -109,7 +111,13 @@ export function registerWsBridge(app: FastifyInstance): void {
                 }
                 if (stopReceived) {
                   openaiWs!.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-                  setTimeout(() => openaiWs?.close(), 500);
+                  awaitingResponse = true;
+                  // Таймаут на случай, если response.done не придёт (например, 10 сек)
+                  responseTimeout = setTimeout(() => {
+                    if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                      openaiWs.close();
+                    }
+                  }, 10000);
                 }
               }, 250);
             });
@@ -132,17 +140,33 @@ export function registerWsBridge(app: FastifyInstance): void {
                 if (agent) {
                   console.log(`[${sid}] Agent: ${agent}`);
                 }
+                if (awaitingResponse && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                  setTimeout(() => openaiWs?.close(), 500);
+                  awaitingResponse = false;
+                  if (responseTimeout) {
+                    clearTimeout(responseTimeout);
+                    responseTimeout = null;
+                  }
+                }
               }
             });
 
             openaiWs.on('close', () => {
               openaiReady = false;
               openaiWs = null;
+              if (responseTimeout) {
+                clearTimeout(responseTimeout);
+                responseTimeout = null;
+              }
             });
             openaiWs.on('error', (err) => {
               console.error(`[${sid}] OpenAI WebSocket error`, err);
               openaiReady = false;
               openaiWs = null;
+              if (responseTimeout) {
+                clearTimeout(responseTimeout);
+                responseTimeout = null;
+              }
             });
           }
           break;
@@ -163,7 +187,13 @@ export function registerWsBridge(app: FastifyInstance): void {
           stopReceived = true;
           if (openaiReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-            setTimeout(() => openaiWs?.close(), 500);
+            awaitingResponse = true;
+            // Таймаут на случай, если response.done не придёт (например, 10 сек)
+            responseTimeout = setTimeout(() => {
+              if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                openaiWs.close();
+              }
+            }, 10000);
           }
           break;
       }
