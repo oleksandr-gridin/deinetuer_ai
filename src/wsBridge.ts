@@ -1,248 +1,237 @@
-import { WebSocket, WebSocketServer } from 'ws';
-import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { webSearchEnabled, OPENAI_API_KEY, currentModel, SYSTEM_MESSAGE, currentVoice } from './config.js';
+import { WebSocketServer, WebSocket, RawData } from 'ws';
+import { FastifyInstance } from 'fastify';
+import {
+  OPENAI_API_KEY,
+  SYSTEM_MESSAGE,
+  currentModel,
+  currentVoice
+} from './config.js';
 
-// Simplified log function to match the requested format
-function log(sid: string, message: string) {
-  console.log(`[${sid}] ${message}`);
+const RESPONSE_TIMEOUT_MS = 15_000;
+
+type Phase = 'IDLE' | 'LISTENING' | 'RESPONDING';
+type LogSocket = WebSocket & { watchAll?: boolean };
+
+interface Session {
+  twilio: WebSocket;
+  openai?: WebSocket;
+  frontends: Set<LogSocket>;
+  state: Phase;
+  streamSid: string;
+  buffer: RawData[];
+  lastAssistantItem?: string;
+  responseStartMs?: number;
+  latestMediaTs?: number;
+  heartbeat: NodeJS.Timeout;
 }
 
-type ToolDefinitionType = {
-  type: "function";
-  name: string;
-  description: string;
-  parameters: {
-    type: "object";
-    properties: {
-      query: {
-        type: "string";
-        description: string;
-      };
-    };
-    required: string[];
-  };
-};
+type LiveLog =
+  | { type: 'conversation.started'; sid: string }
+  | { type: 'conversation.ended'; sid: string }
+  | { type: 'user'; sid: string; text: string }
+  | { type: 'agent'; sid: string; text: string; thinking_ms: number };
 
-const tools: ToolDefinitionType[] = webSearchEnabled ? [{
-  type: "function",
-  name: "deinetuer_search",
-  description: "Search for information on deinetuer.de website to find door-related products and information",
-  parameters: {
-    type: "object",
-    properties: {
-      query: {
-        type: "string",
-        description: "The search terms to look for on deinetuer.de (e.g., 'wooden doors', 'door handles', 'installation guide')"
-      }
-    },
-    required: ["query"]
+const log = (sid: string, m: string) => console.log(`[${sid}] ${m}`);
+const safeSend = (ws: WebSocket | undefined, o: unknown) =>
+  ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(o));
+
+const createSessionUpdate = () => ({
+  type: 'session.update',
+  session: {
+    turn_detection: { type: 'server_vad' },
+    input_audio_format: 'g711_ulaw',
+    output_audio_format: 'g711_ulaw',
+    voice: currentVoice,
+    instructions: SYSTEM_MESSAGE,
+    modalities: ['audio', 'text'],
+    temperature: 0.8,
+    tools: ['web_search'],                        // tool подключён
+    input_audio_transcription: { model: 'whisper-1' }
   }
-}] : [];
+});
 
-function createSessionUpdate() {
-  return {
-    type: 'session.update',
-    session: {
-      turn_detection: { type: 'server_vad' },
-      input_audio_format: 'g711_ulaw',
-      output_audio_format: 'g711_ulaw',
-      voice: currentVoice,
-      instructions: SYSTEM_MESSAGE,
-      modalities: ["text", "audio"],
-      temperature: 0.8,
-      tools,
-      input_audio_transcription: {
-        "model": "whisper-1"
-      }
-    }
-  };
+const sessions = new Map<string, Session>();
+
+const broadcast = (s: Session, p: LiveLog) =>
+  s.frontends.forEach((w) => safeSend(w, p));
+
+function closeSession(s: Session, reason: string) {
+  [s.twilio, s.openai].forEach((ws) =>
+    ws?.readyState === WebSocket.OPEN && ws.close()
+  );
+  s.frontends.forEach((w) => w.readyState === WebSocket.OPEN && w.close());
+  clearInterval(s.heartbeat);
+  sessions.delete(s.streamSid);
+  broadcast(s, { type: 'conversation.ended', sid: s.streamSid });
+  log(s.streamSid, `session closed (${reason})`);
 }
 
-export function registerWsBridge(app: FastifyInstance): void {
-  const wss = new WebSocketServer({ noServer: true });
+export function registerWsBridge(app: FastifyInstance) {
+  const wssMedia = new WebSocketServer({ noServer: true });
+  const wssLogs = new WebSocketServer({ noServer: true });
 
-  wss.on('connection', (ws: WebSocket, request: any) => {
-    const sid = String(request.headers['x-twilio-call-sid'] ?? Date.now());
-    log(sid, 'Connection established between Twilio and server');
+  wssMedia.on('connection', (ws, req) => {
+    const sid = String(req.headers['x-twilio-call-sid'] ?? Date.now());
+    const front = new Set(
+      [...wssLogs.clients].filter(
+        (c): c is LogSocket => !!(c as LogSocket).watchAll
+      )
+    );
 
-    let streamSid: string | undefined;
-    let openaiWs: WebSocket | null = null;
-    let openaiReady = false;
-    let mediaBuffer: any[] = [];
-    let stopReceived = false;
-    let awaitingResponse = false;
-    let responseTimeout: NodeJS.Timeout | null = null;
-    let startTime: number;
+    const session: Session = {
+      twilio: ws,
+      state: 'IDLE',
+      streamSid: sid,
+      buffer: [],
+      heartbeat: setInterval(() => {
+        safeSend(session.twilio, { event: 'ping' });
+        safeSend(session.openai, { type: 'ping' });
+      }, 20_000),
+      frontends: front
+    };
+    sessions.set(sid, session);
 
-    ws.on('message', async (raw) => {
-      let msg;
-      try {
-        msg = JSON.parse(raw.toString());
-      } catch (err) {
-        return;
-      }
-
-      switch (msg.event) {
-        case 'start':
-          if (msg.start) {
-            streamSid = msg.start.streamSid;
-            log(sid, 'Connection starting from Twilio to OpenAI');
-
-            openaiWs = new WebSocket(
-              `wss://api.openai.com/v1/realtime?model=${currentModel}`,
-              {
-                headers: {
-                  Authorization: `Bearer ${OPENAI_API_KEY}`,
-                  'OpenAI-Beta': 'realtime=v1'
-                }
-              }
-            );
-
-            openaiWs.on('open', () => {
-              openaiReady = true;
-              const sessionUpdate = createSessionUpdate();
-              openaiWs!.send(JSON.stringify(sessionUpdate));
-
-              if (mediaBuffer.length > 0) {
-                for (const frame of mediaBuffer) {
-                  openaiWs!.send(frame);
-                }
-                mediaBuffer = [];
-              }
-              if (stopReceived) {
-                openaiWs!.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-                awaitingResponse = true;
-                startTime = Date.now();
-                responseTimeout = setTimeout(() => {
-                  if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-                    openaiWs.close();
-                  }
-                }, 10000);
-              }
-            });
-
-            openaiWs.on('message', (data) => {
-              let event;
-              try {
-                event = JSON.parse(data.toString());
-              } catch (err) {
-                return;
-              }
-
-              if (event.type === 'conversation.item.input_audio_transcription.completed' && event.transcription?.text) {
-                log(sid, `[User]: ${event.transcription.text}`);
-              }
-
-              // Обработка аудиоответов
-              if (event.type === 'response.audio.delta' && event.delta) {
-                const audioDelta = {
-                  event: 'media',
-                  streamSid: streamSid,
-                  media: { payload: event.delta }
-                };
-                ws.send(JSON.stringify(audioDelta));
-                log(sid, 'Sending audio from OpenAI to Twilio');
-              }
-
-              // Обработка завершения ответа
-              if (event.type === 'response.done') {
-                const agent = event.response?.output?.[0]?.content?.find((c: any) => c.transcript)?.transcript;
-                if (agent) {
-                  log(sid, `[Agent]: ${agent}`);
-                  const responseTime = Date.now() - startTime;
-                  log(sid, `Response time: ${responseTime}ms`);
-                }
-                if (awaitingResponse && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-                  setTimeout(() => openaiWs?.close(), 500);
-                  awaitingResponse = false;
-                  if (responseTimeout) {
-                    clearTimeout(responseTimeout);
-                    responseTimeout = null;
-                  }
-                }
-              }
-            });
-
-            openaiWs.on('close', () => {
-              log(sid, 'Connection closed between server and OpenAI');
-              openaiReady = false;
-              openaiWs = null;
-              if (responseTimeout) {
-                clearTimeout(responseTimeout);
-                responseTimeout = null;
-              }
-            });
-
-            openaiWs.on('error', () => {
-              log(sid, 'Error in connection with OpenAI');
-              openaiReady = false;
-              openaiWs = null;
-              if (responseTimeout) {
-                clearTimeout(responseTimeout);
-                responseTimeout = null;
-              }
-            });
-          }
-          break;
-
-        case 'media':
-          const appendMsg = JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: msg.media.payload
-          });
-          if (openaiReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-            openaiWs.send(appendMsg);
-          } else {
-            mediaBuffer.push(appendMsg);
-          }
-          break;
-
-        case 'stop':
-          stopReceived = true;
-          log(sid, 'Media recording stopped, committing audio buffer');
-          startTime = Date.now();
-          if (openaiReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-            openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-            awaitingResponse = true;
-            responseTimeout = setTimeout(() => {
-              if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-                openaiWs.close();
-              }
-            }, 10000);
-          }
-          break;
-      }
-    });
-
-    ws.on('close', () => {
-      log(sid, 'Connection closed between Twilio and server');
-      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.close();
-      }
-    });
-
-    ws.on('error', () => {
-      log(sid, 'Error in connection with Twilio');
-      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.close();
-      }
-    });
+    ws.on('message', (d) => handleTwilio(session, d));
+    ws.on('close', () => closeSession(session, 'twilio closed'));
+    ws.on('error', () => closeSession(session, 'twilio error'));
   });
 
-  app.get('/media-stream', (req: FastifyRequest, reply: FastifyReply) => {
-    reply.raw.writeHead(400);
-    reply.raw.end('This route is for WebSocket connections only');
-  });
+  wssLogs.on('connection', (ws, req) => {
+    const sock = ws as LogSocket;
+    const url = new URL(req.url || '', `http://${req.headers.host}`);
+    const sid = url.searchParams.get('sid') || '*';
 
-  app.server.on('upgrade', (request, socket, head) => {
-    const url = new URL(request.url || '', `http://${request.headers.host}`);
-
-    if (url.pathname === '/media-stream') {
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-      });
+    if (sid === '*') {
+      sock.watchAll = true;
+      sessions.forEach((s) => s.frontends.add(sock));
     } else {
-      socket.destroy();
+      sessions.get(sid)?.frontends.add(sock);
     }
+
+    ws.on('close', () => sessions.forEach((s) => s.frontends.delete(sock)));
   });
+
+  app.server.on('upgrade', (req, socket, head) => {
+    const url = new URL(req.url || '', `http://${req.headers.host}`);
+    if (url.pathname === '/media-stream')
+      wssMedia.handleUpgrade(req, socket, head, (ws) =>
+        wssMedia.emit('connection', ws, req)
+      );
+    else if (url.pathname === '/logs')
+      wssLogs.handleUpgrade(req, socket, head, (ws) =>
+        wssLogs.emit('connection', ws, req)
+      );
+    else socket.destroy();
+  });
+
+  app.get('/media-stream', (_, r) => r.code(400).send('WebSocket only'));
+  app.get('/logs', (_, r) => r.code(400).send('WebSocket only'));
+}
+
+function handleTwilio(s: Session, raw: RawData) {
+  let m: any;
+  try {
+    m = JSON.parse(raw.toString());
+  } catch {
+    return;
+  }
+
+  switch (m.event) {
+    case 'start':
+      s.streamSid = m.start.streamSid;
+      s.state = 'LISTENING';
+      s.latestMediaTs = 0;
+      openOpenAI(s);
+      broadcast(s, { type: 'conversation.started', sid: s.streamSid });
+      break;
+
+    case 'media':
+      s.latestMediaTs = m.media.timestamp;
+      const append = { type: 'input_audio_buffer.append', audio: m.media.payload };
+      s.openai?.readyState === WebSocket.OPEN
+        ? s.openai.send(JSON.stringify(append))
+        : s.buffer.push(Buffer.from(JSON.stringify(append)));
+      break;
+
+    case 'stop':
+      if (s.state !== 'LISTENING') return;
+      s.state = 'RESPONDING';
+      commitAudio(s);
+      break;
+  }
+}
+
+function openOpenAI(s: Session) {
+  if (s.openai) return;
+  const ws = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${currentModel}`,
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
+  );
+  s.openai = ws;
+
+  ws.on('open', () => {
+    safeSend(ws, createSessionUpdate());
+    s.buffer.forEach((b) => ws.send(b));
+    s.buffer.length = 0;
+  });
+
+  ws.on('message', (d) => handleOpenAI(s, d));
+  ws.on('close', () => closeSession(s, 'openai closed'));
+  ws.on('error', () => closeSession(s, 'openai error'));
+}
+
+function commitAudio(s: Session) {
+  if (!s.openai) return;
+  safeSend(s.openai, { type: 'input_audio_buffer.commit' });
+  const killer = setTimeout(
+    () => s.openai?.readyState === WebSocket.OPEN && s.openai.close(),
+    RESPONSE_TIMEOUT_MS
+  );
+  s.openai.once('message', () => clearTimeout(killer));
+}
+
+function handleOpenAI(s: Session, raw: RawData) {
+  let ev: any;
+  try {
+    ev = JSON.parse(raw.toString());
+  } catch {
+    return;
+  }
+
+  switch (ev.type) {
+    case 'conversation.item.input_audio_transcription.completed':
+      if (ev.transcription?.text)
+        broadcast(
+          s,
+          { type: 'user', sid: s.streamSid, text: ev.transcription.text }
+        );
+      break;
+
+    case 'response.audio.delta':
+      if (!s.responseStartMs) s.responseStartMs = s.latestMediaTs;
+      if (ev.item_id) s.lastAssistantItem = ev.item_id;
+
+      safeSend(s.twilio, {
+        event: 'media',
+        streamSid: s.streamSid,
+        media: { payload: ev.delta }
+      });
+      break;
+
+    case 'response.done':
+      const agent =
+        ev.response?.output?.[0]?.content?.find((c: any) => c.transcript)
+          ?.transcript;
+      if (agent) {
+        const rt = Date.now() - (s.responseStartMs ?? Date.now());
+        broadcast(
+          s,
+          { type: 'agent', sid: s.streamSid, text: agent, thinking_ms: rt }
+        );
+      }
+      s.state = 'LISTENING';
+      s.responseStartMs = undefined;
+      safeSend(s.openai, { type: 'input_audio_buffer.reset' });
+      break;
+  }
 }

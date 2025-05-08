@@ -19,7 +19,7 @@ app.all('/incoming-call', async (request, reply) => {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-<Say>Hi, you have called Deine Tür. I am AI Assistent Dory. How can we help?</Say>
+<Say>Hi, you have called Deine Tür. I am AI Assistent. How can we help?</Say>
   <Connect>
     <Stream url="${wsUrl}" />
   </Connect>
