@@ -1,6 +1,6 @@
 import 'dotenv/config';
 
-export const PORT = Number(process.env.PORT) || 5050;
+export const PORT = Number(process.env.PORT) || 8080;
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 export const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 export type voiceType = "alloy" | "ash" | "ballad" | "coral" | "echo" | "sage" | "shimmer" | "verse";
