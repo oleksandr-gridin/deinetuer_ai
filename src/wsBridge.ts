@@ -2,43 +2,29 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { webSearchEnabled, OPENAI_API_KEY, currentModel, SYSTEM_MESSAGE, currentVoice } from './config.js';
 
-// Simplified log function to match the requested format
-function log(sid: string, message: string) {
-  console.log(`[${sid}] ${message}`);
+const LOG_EVENT_TYPES = [
+  'response.content.done',
+  'rate_limits.updated',
+  'response.done',
+  'input_audio_buffer.committed',
+  'input_audio_buffer.speech_stopped',
+  'input_audio_buffer.speech_started',
+  'session.created',
+  'response.text.done',
+  'conversation.item.input_audio_transcription.completed',
+  'response.audio.delta'
+];
+
+function log(sid: string, message: string, data?: any) {
+  const timestamp = new Date().toISOString();
+  if (data !== undefined) {
+    console.log(`[${timestamp}] [${sid}] ${message}`, data);
+  } else {
+    console.log(`[${timestamp}] [${sid}] ${message}`);
+  }
 }
 
-type ToolDefinitionType = {
-  type: "function";
-  name: string;
-  description: string;
-  parameters: {
-    type: "object";
-    properties: {
-      query: {
-        type: "string";
-        description: string;
-      };
-    };
-    required: string[];
-  };
-};
-
-const tools: ToolDefinitionType[] = webSearchEnabled ? [{
-  type: "function",
-  name: "deinetuer_search",
-  description: "Search for information on deinetuer.de website to find door-related products and information",
-  parameters: {
-    type: "object",
-    properties: {
-      query: {
-        type: "string",
-        description: "The search terms to look for on deinetuer.de (e.g., 'wooden doors', 'door handles', 'installation guide')"
-      }
-    },
-    required: ["query"]
-  }
-}] : [];
-
+// Функция для отправки обновления сессии
 function createSessionUpdate() {
   return {
     type: 'session.update',
@@ -50,7 +36,6 @@ function createSessionUpdate() {
       instructions: SYSTEM_MESSAGE,
       modalities: ["text", "audio"],
       temperature: 0.8,
-      tools,
       input_audio_transcription: {
         "model": "whisper-1"
       }
@@ -63,7 +48,7 @@ export function registerWsBridge(app: FastifyInstance): void {
 
   wss.on('connection', (ws: WebSocket, request: any) => {
     const sid = String(request.headers['x-twilio-call-sid'] ?? Date.now());
-    log(sid, 'Connection established between Twilio and server');
+    log(sid, 'New WebSocket connection established');
 
     let streamSid: string | undefined;
     let openaiWs: WebSocket | null = null;
@@ -72,13 +57,13 @@ export function registerWsBridge(app: FastifyInstance): void {
     let stopReceived = false;
     let awaitingResponse = false;
     let responseTimeout: NodeJS.Timeout | null = null;
-    let startTime: number;
 
     ws.on('message', async (raw) => {
       let msg;
       try {
         msg = JSON.parse(raw.toString());
       } catch (err) {
+        log(sid, 'Error parsing Twilio message', { error: err, raw: raw.toString() });
         return;
       }
 
@@ -86,7 +71,6 @@ export function registerWsBridge(app: FastifyInstance): void {
         case 'start':
           if (msg.start) {
             streamSid = msg.start.streamSid;
-            log(sid, 'Connection starting from Twilio to OpenAI');
 
             openaiWs = new WebSocket(
               `wss://api.openai.com/v1/realtime?model=${currentModel}`,
@@ -101,6 +85,7 @@ export function registerWsBridge(app: FastifyInstance): void {
             openaiWs.on('open', () => {
               openaiReady = true;
               const sessionUpdate = createSessionUpdate();
+              console.log(`[${sid}] Sending session update:`, sessionUpdate);
               openaiWs!.send(JSON.stringify(sessionUpdate));
 
               if (mediaBuffer.length > 0) {
@@ -112,7 +97,6 @@ export function registerWsBridge(app: FastifyInstance): void {
               if (stopReceived) {
                 openaiWs!.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
                 awaitingResponse = true;
-                startTime = Date.now();
                 responseTimeout = setTimeout(() => {
                   if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
                     openaiWs.close();
@@ -126,11 +110,12 @@ export function registerWsBridge(app: FastifyInstance): void {
               try {
                 event = JSON.parse(data.toString());
               } catch (err) {
+                console.error(`[${sid}] Error parsing OpenAI message`, err);
                 return;
               }
 
-              if (event.type === 'conversation.item.input_audio_transcription.completed' && event.transcription?.text) {
-                log(sid, `[User]: ${event.transcription.text}`);
+              if (LOG_EVENT_TYPES.includes(event.type)) {
+                console.log(`[${sid}] OpenAI event:`, event);
               }
 
               // Обработка аудиоответов
@@ -141,16 +126,14 @@ export function registerWsBridge(app: FastifyInstance): void {
                   media: { payload: event.delta }
                 };
                 ws.send(JSON.stringify(audioDelta));
-                log(sid, 'Sending audio from OpenAI to Twilio');
+                console.log(`[${sid}] Sent audio back to Twilio`);
               }
 
               // Обработка завершения ответа
               if (event.type === 'response.done') {
                 const agent = event.response?.output?.[0]?.content?.find((c: any) => c.transcript)?.transcript;
                 if (agent) {
-                  log(sid, `[Agent]: ${agent}`);
-                  const responseTime = Date.now() - startTime;
-                  log(sid, `Response time: ${responseTime}ms`);
+                  console.log(`[${sid}] Agent: ${agent}`);
                 }
                 if (awaitingResponse && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
                   setTimeout(() => openaiWs?.close(), 500);
@@ -164,7 +147,6 @@ export function registerWsBridge(app: FastifyInstance): void {
             });
 
             openaiWs.on('close', () => {
-              log(sid, 'Connection closed between server and OpenAI');
               openaiReady = false;
               openaiWs = null;
               if (responseTimeout) {
@@ -173,8 +155,8 @@ export function registerWsBridge(app: FastifyInstance): void {
               }
             });
 
-            openaiWs.on('error', () => {
-              log(sid, 'Error in connection with OpenAI');
+            openaiWs.on('error', (err) => {
+              console.error(`[${sid}] OpenAI WebSocket error`, err);
               openaiReady = false;
               openaiWs = null;
               if (responseTimeout) {
@@ -199,8 +181,6 @@ export function registerWsBridge(app: FastifyInstance): void {
 
         case 'stop':
           stopReceived = true;
-          log(sid, 'Media recording stopped, committing audio buffer');
-          startTime = Date.now();
           if (openaiReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
             awaitingResponse = true;
@@ -215,14 +195,14 @@ export function registerWsBridge(app: FastifyInstance): void {
     });
 
     ws.on('close', () => {
-      log(sid, 'Connection closed between Twilio and server');
+      log(sid, 'Twilio WebSocket closed');
       if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
         openaiWs.close();
       }
     });
 
-    ws.on('error', () => {
-      log(sid, 'Error in connection with Twilio');
+    ws.on('error', (err) => {
+      log(sid, 'Twilio WebSocket error', err);
       if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
         openaiWs.close();
       }
@@ -230,18 +210,21 @@ export function registerWsBridge(app: FastifyInstance): void {
   });
 
   app.get('/media-stream', (req: FastifyRequest, reply: FastifyReply) => {
+    log('system', 'HTTP request to WebSocket endpoint', { method: req.method, url: req.url });
     reply.raw.writeHead(400);
     reply.raw.end('This route is for WebSocket connections only');
   });
 
   app.server.on('upgrade', (request, socket, head) => {
     const url = new URL(request.url || '', `http://${request.headers.host}`);
+    log('system', 'WebSocket upgrade request', { path: url.pathname });
 
     if (url.pathname === '/media-stream') {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
     } else {
+      log('system', 'Rejected WebSocket upgrade - invalid path', { path: url.pathname });
       socket.destroy();
     }
   });
