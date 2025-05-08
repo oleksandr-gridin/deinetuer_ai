@@ -1,11 +1,13 @@
 import Fastify from 'fastify';
 import { setModel, currentModel, setVoice, currentVoice, setWebSearch, webSearchEnabled, voiceType } from './config.js';
 import { registerWsBridge } from './wsBridge.js';
+import formbody from '@fastify/formbody';
 
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
 const app = Fastify({ logger: true });
+app.register(formbody);
 
 app.get('/healthz', async (request, reply) => {
   const host = request.headers['host'];
