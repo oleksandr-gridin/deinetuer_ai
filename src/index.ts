@@ -10,9 +10,7 @@ const app = Fastify({ logger: true });
 app.register(formbody);
 
 app.get('/healthz', async (request, reply) => {
-  const host = request.headers['host'];
-  const wsUrl = `wss://${host}/media-stream`;
-  reply.send({ status: 'ok', message: `Server is running, host:${host} wsUrl: ${wsUrl}` });
+  reply.send({ status: 'ok', message: `Server is running` });
 });
 
 app.all('/incoming-call', async (request, reply) => {
@@ -21,13 +19,11 @@ app.all('/incoming-call', async (request, reply) => {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-<Say>Hi, you have called Deinetuer door shop. How can we help?</Say>
-    <Pause length="1"/>
+<Say>Hi, you have called Deine Tür. I am AI Assistent Dory. How can we help?</Say>
   <Connect>
     <Stream url="${wsUrl}" />
   </Connect>
 </Response>`;
-  console.log(twiml)
   reply.type('text/xml').send(twiml);
 });
 

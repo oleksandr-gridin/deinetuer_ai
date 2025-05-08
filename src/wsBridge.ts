@@ -2,19 +2,6 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { webSearchEnabled, OPENAI_API_KEY, currentModel, SYSTEM_MESSAGE, currentVoice } from './config.js';
 
-const LOG_EVENT_TYPES = [
-  'response.content.done',
-  'rate_limits.updated',
-  'response.done',
-  'input_audio_buffer.committed',
-  'input_audio_buffer.speech_stopped',
-  'input_audio_buffer.speech_started',
-  'session.created',
-  'response.text.done',
-  'conversation.item.input_audio_transcription.completed',
-  'response.audio.delta'
-];
-
 function log(sid: string, message: string, data?: any) {
   const timestamp = new Date().toISOString();
   if (data !== undefined) {
@@ -23,38 +10,6 @@ function log(sid: string, message: string, data?: any) {
     console.log(`[${timestamp}] [${sid}] ${message}`);
   }
 }
-
-type ToolDefinitionType = {
-  type: "function";
-  name: string;
-  description: string;
-  parameters: {
-    type: "object";
-    properties: {
-      query: {
-        type: "string";
-        description: string;
-      };
-    };
-    required: string[];
-  };
-};
-
-const tools: ToolDefinitionType[] = webSearchEnabled ? [{
-  type: "function",
-  name: "deinetuer_search",
-  description: "Search for information on deinetuer.de website to find door-related products and information",
-  parameters: {
-    type: "object",
-    properties: {
-      query: {
-        type: "string",
-        description: "The search terms to look for on deinetuer.de (e.g., 'wooden doors', 'door handles', 'installation guide')"
-      }
-    },
-    required: ["query"]
-  }
-}] : [];
 
 // Функция для отправки обновления сессии
 function createSessionUpdate() {
@@ -68,7 +23,7 @@ function createSessionUpdate() {
       instructions: SYSTEM_MESSAGE,
       modalities: ["text", "audio"],
       temperature: 0.8,
-      tools,
+      max_output_tokens: 150, // Ограничение длины ответа (~3-4 предложения)
       input_audio_transcription: {
         "model": "whisper-1"
       }
@@ -118,7 +73,6 @@ export function registerWsBridge(app: FastifyInstance): void {
             openaiWs.on('open', () => {
               openaiReady = true;
               const sessionUpdate = createSessionUpdate();
-              console.log(`[${sid}] Sending session update:`, sessionUpdate);
               openaiWs!.send(JSON.stringify(sessionUpdate));
 
               if (mediaBuffer.length > 0) {
@@ -147,11 +101,11 @@ export function registerWsBridge(app: FastifyInstance): void {
                 return;
               }
 
-              if (LOG_EVENT_TYPES.includes(event.type)) {
-                console.log(`[${sid}] OpenAI event:`, event);
+              // Логируем только важные события
+              if (event.type === 'conversation.item.input_audio_transcription.completed' && event.transcript) {
+                console.log(`[User]: ${event.transcript}`);
               }
 
-              // Обработка аудиоответов
               if (event.type === 'response.audio.delta' && event.delta) {
                 const audioDelta = {
                   event: 'media',
@@ -159,15 +113,18 @@ export function registerWsBridge(app: FastifyInstance): void {
                   media: { payload: event.delta }
                 };
                 ws.send(JSON.stringify(audioDelta));
-                console.log(`[${sid}] Sent audio back to Twilio`);
               }
 
-              // Обработка завершения ответа
               if (event.type === 'response.done') {
+                const startTime = Date.now();
                 const agent = event.response?.output?.[0]?.content?.find((c: any) => c.transcript)?.transcript;
+                const endTime = Date.now();
+
                 if (agent) {
-                  console.log(`[${sid}] Agent: ${agent}`);
+                  console.log(`[Agent]: ${agent}`);
+                  console.log(`[Bot Thinking Time]: ${(endTime - startTime)}ms`);
                 }
+
                 if (awaitingResponse && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
                   setTimeout(() => openaiWs?.close(), 500);
                   awaitingResponse = false;
