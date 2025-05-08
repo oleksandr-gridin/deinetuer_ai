@@ -84,11 +84,18 @@ function cleanup(session: Session, reason: string) {
 }
 
 export function registerWsBridge(app: FastifyInstance) {
-  const wssMedia = new WebSocketServer({ noServer: true });
+  const wssMedia = new WebSocketServer({
+    noServer: true,
+      handleProtocols: (protocols) =>
+      protocols.has('audio') ? 'audio' : false,
+  });
   const wssLogs = new WebSocketServer({ noServer: true });
 
   wssMedia.on('connection', (ws, req) => {
-    const sid = String(req.headers['x-twilio-call-sid'] ?? Date.now());
+    const sid =
+      typeof req.headers['x-twilio-callsid'] === 'string'
+        ? req.headers['x-twilio-callsid']
+        : String(Date.now());
     const session: Session = {
       twilio: ws,
       state: 'IDLE',
