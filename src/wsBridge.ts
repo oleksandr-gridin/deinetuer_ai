@@ -86,7 +86,7 @@ function cleanup(session: Session, reason: string) {
 export function registerWsBridge(app: FastifyInstance) {
   const wssMedia = new WebSocketServer({
     noServer: true,
-      handleProtocols: (protocols) =>
+    handleProtocols: (protocols) =>
       protocols.has('audio') ? 'audio' : false,
   });
   const wssLogs = new WebSocketServer({ noServer: true });
@@ -197,17 +197,14 @@ function openOpenAI(session: Session) {
     session.buffer.length = 0;
   });
   ws.on('message', (d) => handleOpenAI(session, d));
-  ws.on('close', () => cleanup(session, 'openai closed'));
+  ws.on('close', () => session.openai = undefined);
   ws.on('error', () => cleanup(session, 'openai error'));
 }
 
 function commitAudio(session: Session) {
   if (!session.openai) return;
   safeSend(session.openai, { type: 'input_audio_buffer.commit' });
-  const killer = setTimeout(() => {
-    if (session.openai?.readyState === WebSocket.OPEN) session.openai.close();
-  }, RESPONSE_TIMEOUT_MS);
-  session.openai.once('message', () => clearTimeout(killer));
+  session.openai.once('message', () => 'Audio sent');
 }
 
 function handleOpenAI(session: Session, raw: RawData) {
