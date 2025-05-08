@@ -7,11 +7,18 @@ type ToolDefinitionType = {
   name: string;
   description: string;
   parameters: {
-    domain_allowlist: string[];
+    type: "object";
+    properties: {
+      query: {
+        type: "string";
+        description: string;
+      };
+    };
+    required: string[];
   };
 };
 
-const tools = webSearchEnabled ? [{
+const tools: ToolDefinitionType[] = webSearchEnabled ? [{
   type: "function",
   name: "deinetuer_search",
   description: "Search for information on deinetuer.de website to find door-related products and information",
@@ -51,7 +58,6 @@ export function registerWsBridge(app: FastifyInstance): void {
     let sessionConfig: any = null;
     let stopReceived = false;
 
-    // --- Twilio → OpenAI ---
     ws.on('message', async (raw) => {
       let msg;
       try {
@@ -102,7 +108,7 @@ export function registerWsBridge(app: FastifyInstance): void {
                   mediaBuffer = [];
                 }
                 if (stopReceived) {
-                  openaiWs!.send(JSON.stringify({ type: 'input_audio_buffer.end' }));
+                  openaiWs!.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
                   setTimeout(() => openaiWs?.close(), 500);
                 }
               }, 250);
@@ -118,7 +124,6 @@ export function registerWsBridge(app: FastifyInstance): void {
               }
               console.log(`[${sid}] OpenAI event:`, event);
 
-              // 1. Транскрипция текста
               if (event.type === 'conversation.item.input_audio_transcription.completed' && event.transcript) {
                 console.log(`[${sid}] User: ${event.transcript}`);
               }
@@ -157,7 +162,7 @@ export function registerWsBridge(app: FastifyInstance): void {
         case 'stop':
           stopReceived = true;
           if (openaiReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-            openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.end' }));
+            openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
             setTimeout(() => openaiWs?.close(), 500);
           }
           break;
