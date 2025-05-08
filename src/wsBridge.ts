@@ -12,6 +12,7 @@ type ToolDefinitionType = {
 };
 
 const tools = webSearchEnabled ? [{
+  type: "function",
   name: "deinetuer_search",
   description: "Search for information on deinetuer.de website to find door-related products and information",
   parameters: {
