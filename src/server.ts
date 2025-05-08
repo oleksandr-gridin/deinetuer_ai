@@ -7,8 +7,10 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 5050;
 
 const app = Fastify({ logger: true });
 
-app.get('/', async (request, reply) => {
-  reply.send({ status: 'ok', message: 'Server is running' });
+app.get('/healthz', async (request, reply) => {
+  const host = request.headers['host'];
+  const wsUrl = `wss://${host}/media-stream`;
+  reply.send({ status: 'ok', message: `Server is running, host:${host} wsUrl: ${wsUrl}` });
 });
 
 app.all('/incoming-call', async (request, reply) => {
