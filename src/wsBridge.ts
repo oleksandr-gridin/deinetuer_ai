@@ -23,7 +23,21 @@ type ToolDefinitionType = {
   };
 };
 
-const tools = webSearchEnabled ? ['web_search'] : [];
+const tools: ToolDefinitionType[] = webSearchEnabled ? [{
+  type: "function",
+  name: "deinetuer_search",
+  description: "Search for information on deinetuer.de website to find door-related products and information",
+  parameters: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: "The search terms to look for on deinetuer.de (e.g., 'wooden doors', 'door handles', 'installation guide')"
+      }
+    },
+    required: ["query"]
+  }
+}] : [];
 
 function createSessionUpdate() {
   return {
