@@ -117,7 +117,7 @@ export function registerWsBridge(app: FastifyInstance): void {
                   if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
                     openaiWs.close();
                   }
-                }, 10000);
+                }, 1000);
               }
             });
 
