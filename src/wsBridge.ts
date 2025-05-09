@@ -1,365 +1,232 @@
-// wsBridge.ts
-import { WebSocketServer, WebSocket, RawData } from 'ws';
-import { FastifyInstance } from 'fastify';
-import {
-  OPENAI_API_KEY,
-  currentModel,
-  SYSTEM_MESSAGE,
-  currentVoice,
-  webSearchEnabled,
-} from './config.js';
-import functions from './functionHandlers.js';
+import { WebSocket, WebSocketServer } from 'ws';
+import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { webSearchEnabled, OPENAI_API_KEY, currentModel, SYSTEM_MESSAGE, currentVoice } from './config.js';
 
-/* ---------- типы ---------- */
-type Phase = 'IDLE' | 'LISTENING' | 'RESPONDING';
+const LOG_EVENT_TYPES = [
+  'response.content.done',
+  'rate_limits.updated',
+  'response.done',
+  'input_audio_buffer.committed',
+  'input_audio_buffer.speech_stopped',
+  'input_audio_buffer.speech_started',
+  'session.created',
+  'response.text.done',
+  'conversation.item.input_audio_transcription.completed',
+  'response.audio.delta'
+];
 
-interface Session {
-  twilio: WebSocket;            // сокет Twilio-Media-Stream
-  openai?: WebSocket;           // сокет OpenAI realtime
-  frontends: Set<WebSocket>;    // наблюдатели /logs
-  state: Phase;
-  streamSid: string;
-  buffer: RawData[];            // буфер кадров, пока OpenAI не открыт
-  lastAssistantItem?: string;   // id последнего assistant-item
-  responseStartMs?: number;     // ts начала ответа
-  latestMediaTs?: number;       // ts последнего media-кадра
-  heartbeat: NodeJS.Timeout;    // ping-loop
+function log(sid: string, message: string, data?: any) {
+  const timestamp = new Date().toISOString();
+  if (data !== undefined) {
+    console.log(`[${timestamp}] [${sid}] ${message}`, data);
+  } else {
+    console.log(`[${timestamp}] [${sid}] ${message}`);
+  }
 }
 
-type LiveLog =
-  | { type: 'conversation.started'; sid: string }
-  | { type: 'conversation.ended'; sid: string }
-  | { type: 'user'; sid: string; text: string }
-  | { type: 'agent'; sid: string; text: string; thinking_ms: number };
-
-const tools = webSearchEnabled ? ['web_search'] : [];
-
-/* ---------- утилиты ---------- */
-const sessionPool = new Map<string, Session>();
-const log = (sid: string, m: string) => console.log(`[${sid}] ${m}`);
-
-const safeSend = (ws: WebSocket | undefined, obj: unknown) => {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-};
-
-const createSessionUpdate = () => ({
-  type: 'session.update',
-  session: {
-    turn_detection: { type: 'server_vad' },
-    input_audio_format: 'g711_ulaw',
-    output_audio_format: 'g711_ulaw',
-    voice: currentVoice,
-    instructions: SYSTEM_MESSAGE,
-    modalities: ['text', 'audio'],
-    temperature: 0.8,
-    tools,
-    input_audio_transcription: { model: 'whisper-1' },
-  },
-});
-
-function broadcast(session: Session, payload: LiveLog) {
-  session.frontends.forEach((ws) => safeSend(ws, payload));
-}
-
-function logLive(session: Session, payload: LiveLog, consoleTxt?: string) {
-  if (consoleTxt) log(session.streamSid, consoleTxt);
-  broadcast(session, payload);
-}
-
-function cleanup(session: Session, reason: string) {
-  ['twilio', 'openai', 'frontends'].forEach((k: any) => {
-    const conn = (session as any)[k];
-    if (!conn) return;
-
-    if (k === 'frontends') {
-      (conn as Set<WebSocket>).forEach((w) =>
-        w.readyState === WebSocket.OPEN && w.close()
-      );
-    } else if ((conn as WebSocket).readyState === WebSocket.OPEN) {
-      (conn as WebSocket).close();
+// Функция для отправки обновления сессии
+function createSessionUpdate() {
+  return {
+    type: 'session.update',
+    session: {
+      turn_detection: { type: 'server_vad' },
+      input_audio_format: 'g711_ulaw',
+      output_audio_format: 'g711_ulaw',
+      voice: currentVoice,
+      instructions: SYSTEM_MESSAGE,
+      modalities: ["text", "audio"],
+      temperature: 0.8,
+      tools: webSearchEnabled ? ["web_search"] : [],
+      input_audio_transcription: {
+        "model": "whisper-1"
+      }
     }
-  });
-
-  clearInterval(session.heartbeat);
-  sessionPool.delete(session.streamSid);
-  logLive(session, { type: 'conversation.ended', sid: session.streamSid });
-  log(session.streamSid, `session closed (${reason})`);
+  };
 }
 
-/* ---------- экспортируемая точка ---------- */
-export function registerWsBridge(app: FastifyInstance) {
-  /* --- 1. Сокет для аудио от Twilio ---- */
-  const wssMedia = new WebSocketServer({
-    noServer: true,
-    // обязательно подтверждаем «audio»
-    handleProtocols: (protocols) => (protocols.has('audio') ? 'audio' : false),
-  });
+export function registerWsBridge(app: FastifyInstance): void {
+  const wss = new WebSocketServer({ noServer: true });
 
-  /* --- 2. Сокет для лог-клиентов (/logs) --- */
-  const wssLogs = new WebSocketServer({ noServer: true });
+  wss.on('connection', (ws: WebSocket, request: any) => {
+    const sid = String(request.headers['x-twilio-call-sid'] ?? Date.now());
+    log(sid, 'New WebSocket connection established');
 
-  /* ---------- Twilio-side connection ---------- */
-  wssMedia.on('connection', (ws, req) => {
-    const sid =
-      typeof req.headers['x-twilio-callsid'] === 'string'
-        ? req.headers['x-twilio-callsid']
-        : String(Date.now());
+    let streamSid: string | undefined;
+    let openaiWs: WebSocket | null = null;
+    let openaiReady = false;
+    let mediaBuffer: any[] = [];
+    let stopReceived = false;
+    let awaitingResponse = false;
+    let responseTimeout: NodeJS.Timeout | null = null;
 
-    const session: Session = {
-      twilio: ws,
-      state: 'IDLE',
-      streamSid: sid,
-      buffer: [],
-      heartbeat: setInterval(() => {
-        // используем настоящий ping-фрейм
-        session.twilio.ping();
-        session.openai?.ping?.();
-      }, 20_000),
-      frontends: new Set(
-        [...wssLogs.clients].filter((c: any) => c['watchAll'])
-      ),
-    };
-    sessionPool.set(sid, session);
+    ws.on('message', async (raw) => {
+      let msg;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch (err) {
+        log(sid, 'Error parsing Twilio message', { error: err, raw: raw.toString() });
+        return;
+      }
 
-    ws.on('message', (d) => handleTwilio(session, d));
-    ws.on('close', () => cleanup(session, 'twilio closed'));
-    ws.on('error', () => cleanup(session, 'twilio error'));
-  });
+      switch (msg.event) {
+        case 'start':
+          if (msg.start) {
+            streamSid = msg.start.streamSid;
 
-  /* ---------- клиентские логи ---------- */
-  wssLogs.on('connection', (ws, req) => {
-    const url = new URL(req.url || '', `http://${req.headers.host}`);
-    const sid = url.searchParams.get('sid') || '*';
-      sessionPool.get(sid)?.frontends.add(ws);
-    
+            openaiWs = new WebSocket(
+              `wss://api.openai.com/v1/realtime?model=${currentModel}`,
+              {
+                headers: {
+                  Authorization: `Bearer ${OPENAI_API_KEY}`,
+                  'OpenAI-Beta': 'realtime=v1'
+                }
+              }
+            );
+
+            openaiWs.on('open', () => {
+              openaiReady = true;
+              const sessionUpdate = createSessionUpdate();
+              console.log(`[${sid}] Sending session update:`, sessionUpdate);
+              openaiWs!.send(JSON.stringify(sessionUpdate));
+
+              if (mediaBuffer.length > 0) {
+                for (const frame of mediaBuffer) {
+                  openaiWs!.send(frame);
+                }
+                mediaBuffer = [];
+              }
+              if (stopReceived) {
+                openaiWs!.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+                awaitingResponse = true;
+                responseTimeout = setTimeout(() => {
+                  if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                    openaiWs.close();
+                  }
+                }, 10000);
+              }
+            });
+
+            openaiWs.on('message', (data) => {
+              let event;
+              try {
+                event = JSON.parse(data.toString());
+              } catch (err) {
+                console.error(`[${sid}] Error parsing OpenAI message`, err);
+                return;
+              }
+
+              if (LOG_EVENT_TYPES.includes(event.type)) {
+                console.log(`[${sid}] OpenAI event:`, event);
+              }
+
+              // Обработка аудиоответов
+              if (event.type === 'response.audio.delta' && event.delta) {
+                const audioDelta = {
+                  event: 'media',
+                  streamSid: streamSid,
+                  media: { payload: event.delta }
+                };
+                ws.send(JSON.stringify(audioDelta));
+                console.log(`[${sid}] Sent audio back to Twilio`);
+              }
+
+              // Обработка завершения ответа
+              if (event.type === 'response.done') {
+                const agent = event.response?.output?.[0]?.content?.find((c: any) => c.transcript)?.transcript;
+                if (agent) {
+                  console.log(`[${sid}] Agent: ${agent}`);
+                }
+                if (awaitingResponse && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                  setTimeout(() => openaiWs?.close(), 500);
+                  awaitingResponse = false;
+                  if (responseTimeout) {
+                    clearTimeout(responseTimeout);
+                    responseTimeout = null;
+                  }
+                }
+              }
+            });
+
+            openaiWs.on('close', () => {
+              openaiReady = false;
+              openaiWs = null;
+              if (responseTimeout) {
+                clearTimeout(responseTimeout);
+                responseTimeout = null;
+              }
+            });
+
+            openaiWs.on('error', (err) => {
+              console.error(`[${sid}] OpenAI WebSocket error`, err);
+              openaiReady = false;
+              openaiWs = null;
+              if (responseTimeout) {
+                clearTimeout(responseTimeout);
+                responseTimeout = null;
+              }
+            });
+          }
+          break;
+
+        case 'media':
+          const appendMsg = JSON.stringify({
+            type: 'input_audio_buffer.append',
+            audio: msg.media.payload
+          });
+          if (openaiReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            openaiWs.send(appendMsg);
+          } else {
+            mediaBuffer.push(appendMsg);
+          }
+          break;
+
+        case 'stop':
+          stopReceived = true;
+          if (openaiReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+            awaitingResponse = true;
+            responseTimeout = setTimeout(() => {
+              if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                openaiWs.close();
+              }
+            }, 10000);
+          }
+          break;
+      }
+    });
 
     ws.on('close', () => {
-      sessionPool.forEach((s) => s.frontends.delete(ws));
+      log(sid, 'Twilio WebSocket closed');
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.close();
+      }
+    });
+
+    ws.on('error', (err) => {
+      log(sid, 'Twilio WebSocket error', err);
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.close();
+      }
     });
   });
 
-  /* ---------- HTTP→WebSocket upgrade ---------- */
-  app.server.on('upgrade', (req, socket, head) => {
-    const url = new URL(req.url || '', `http://${req.headers.host}`);
+  app.get('/media-stream', (req: FastifyRequest, reply: FastifyReply) => {
+    log('system', 'HTTP request to WebSocket endpoint', { method: req.method, url: req.url });
+    reply.raw.writeHead(400);
+    reply.raw.end('This route is for WebSocket connections only');
+  });
+
+  app.server.on('upgrade', (request, socket, head) => {
+    const url = new URL(request.url || '', `http://${request.headers.host}`);
+    log('system', 'WebSocket upgrade request', { path: url.pathname });
+
     if (url.pathname === '/media-stream') {
-      wssMedia.handleUpgrade(req, socket, head, (ws) =>
-        wssMedia.emit('connection', ws, req)
-      );
-    } else if (url.pathname === '/logs') {
-      wssLogs.handleUpgrade(req, socket, head, (ws) =>
-        wssLogs.emit('connection', ws, req)
-      );
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
     } else {
+      log('system', 'Rejected WebSocket upgrade - invalid path', { path: url.pathname });
       socket.destroy();
     }
   });
-
-  /* Fallback для попытки HTTP GET */
-  app.get('/media-stream', (_, r) => r.code(400).send('WebSocket only'));
-  app.get('/logs', (_, r) => r.code(400).send('WebSocket only'));
-}
-
-/* =================================================================== */
-/*                          HANDLERS                                   */
-/* =================================================================== */
-
-function handleTwilio(session: Session, raw: RawData) {
-  let m: any;
-  try {
-    m = JSON.parse(raw.toString());
-  } catch {
-    return;
-  }
-
-  switch (m.event) {
-    case 'start':
-      session.streamSid = m.start.streamSid;
-      session.state = 'LISTENING';
-      session.latestMediaTs = 0;
-      openOpenAI(session);
-      logLive(session, { type: 'conversation.started', sid: session.streamSid });
-      break;
-
-    case 'media':
-      session.latestMediaTs = m.media.timestamp;
-      const append = {
-        type: 'input_audio_buffer.append',
-        audio: m.media.payload,
-      };
-      if (session.openai?.readyState === WebSocket.OPEN)
-        session.openai.send(JSON.stringify(append));
-      else session.buffer.push(Buffer.from(JSON.stringify(append)));
-      break;
-
-    case 'stop':
-      if (session.state !== 'LISTENING') return;
-      session.state = 'RESPONDING';
-      commitAudio(session);
-      break;
-  }
-}
-
-/* ---------- OpenAI socket ---------- */
-function openOpenAI(session: Session) {
-  if (session.openai) return;
-
-  const ws = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${currentModel}`,
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1',
-      },
-    }
-  );
-  session.openai = ws;
-
-  ws.on('open', () => {
-    safeSend(ws, createSessionUpdate());
-    session.buffer.forEach((b) => ws.send(b));
-    session.buffer.length = 0;
-  });
-
-  ws.on('message', (d) => handleOpenAI(session, d));
-
-  // если OpenAI «упал», просто помечаем, но не убиваем звонок
-  ws.on('close', () => (session.openai = undefined));
-  ws.on('error', () => (session.openai = undefined));
-}
-
-function commitAudio(session: Session) {
-  if (!session.openai) return;
-  safeSend(session.openai, { type: 'input_audio_buffer.commit' });
-}
-
-function handleOpenAI(session: Session, raw: RawData) {
-  let ev: any;
-  try {
-    ev = JSON.parse(raw.toString());
-  } catch {
-    return;
-  }
-  broadcast(session, ev);
-
-  switch (ev.type) {
-    case 'conversation.item.input_audio_transcription.completed':
-      if (ev.transcription?.text)
-        logLive(
-          session,
-          { type: 'user', sid: session.streamSid, text: ev.transcription.text },
-          `[User] ${ev.transcription.text}`
-        );
-      break;
-
-    case 'input_audio_buffer.speech_started':
-      handleTruncation(session);
-      break;
-
-    case 'response.audio.delta':
-      forwardAudioDelta(session, ev);
-      break;
-
-    case 'response.output_item.done':
-      if (ev.item?.type === 'function_call')
-        handleFunctionCall(session, ev.item);
-      break;
-
-    case 'response.done':
-      finishTurn(session, ev);
-      break;
-  }
-}
-
-/* ---------- отправляем аудио в Twilio ---------- */
-function forwardAudioDelta(session: Session, ev: any) {
-  if (!session.twilio || !session.streamSid) return;
-
-  if (!session.responseStartMs)
-    session.responseStartMs = session.latestMediaTs;
-
-  if (ev.item_id) session.lastAssistantItem = ev.item_id;
-
-  safeSend(session.twilio, {
-    event: 'media',
-    streamSid: session.streamSid,
-    media: {
-      track: 'outbound',          // ОБЯЗАТЕЛЬНО!
-      payload: ev.delta,
-    },
-  });
-
-  safeSend(session.twilio, { event: 'mark', streamSid: session.streamSid });
-}
-
-function finishTurn(session: Session, ev: any) {
-  const agent =
-    ev.response?.output?.[0]?.content?.find((c: any) => c.transcript)
-      ?.transcript;
-
-  if (agent) {
-    const rt = Date.now() - (session.responseStartMs ?? Date.now());
-    logLive(
-      session,
-      { type: 'agent', sid: session.streamSid, text: agent, thinking_ms: rt },
-      `[Agent] ${agent} (${rt}ms)`
-    );
-  }
-
-  session.state = 'LISTENING';
-  session.responseStartMs = undefined;
-  safeSend(session.openai, { type: 'input_audio_buffer.reset' });
-}
-
-function handleTruncation(session: Session) {
-  if (
-    !session.lastAssistantItem ||
-    session.responseStartMs === undefined ||
-    !session.openai
-  )
-    return;
-
-  const elapsed =
-    (session.latestMediaTs ?? 0) - (session.responseStartMs ?? 0);
-  const audio_end_ms = Math.max(elapsed, 0);
-
-  safeSend(session.openai, {
-    type: 'conversation.item.truncate',
-    item_id: session.lastAssistantItem,
-    content_index: 0,
-    audio_end_ms,
-  });
-
-  safeSend(session.twilio, { event: 'clear', streamSid: session.streamSid });
-  session.lastAssistantItem = undefined;
-}
-
-/* ---------- функция-tools ---------- */
-async function handleFunctionCall(session: Session, item: any) {
-  const def = functions.find((f) => f.schema.name === item.name);
-  if (!def) return;
-
-  let args: any;
-  try {
-    args = JSON.parse(item.arguments);
-  } catch {
-    return;
-  }
-
-  let output;
-  try {
-    output = await def.handler(args);
-  } catch (e: any) {
-    output = { error: e.message };
-  }
-
-  safeSend(session.openai, {
-    type: 'conversation.item.create',
-    item: {
-      type: 'function_call_output',
-      call_id: item.call_id,
-      output: JSON.stringify(output),
-    },
-  });
-
-  safeSend(session.openai, { type: 'response.create' });
 }
